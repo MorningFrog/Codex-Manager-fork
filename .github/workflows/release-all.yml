@@ -209,12 +209,16 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            appimage_arch: amd64
             rust_target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - arch: arm64
+            appimage_arch: aarch64
             rust_target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
+    env:
+      LDAI_UPDATE_INFORMATION: gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|latest|CodexManager_*_${{ matrix.appimage_arch }}.AppImage.zsync
 
     steps:
       - name: Checkout
@@ -233,7 +237,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libsoup-3.0-dev squashfs-tools zip
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libsoup-3.0-dev squashfs-tools zip zsync
 
       - name: Test AppImage icon portability repair
         run: bash scripts/release/tests/ensure-appimage-diricon.test.sh
@@ -254,6 +258,24 @@ jobs:
         shell: bash
         run: bash scripts/release/ensure-appimage-diricon.sh "${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/bundle/appimage/"*.AppImage
 
+      # Icon/permission repairs can rewrite the image, invalidating the
+      # bundler's zsync checksums. Always regenerate from the final bytes.
+      - name: Generate final AppImage update metadata
+        shell: bash
+        env:
+          APPIMAGE_DIR: ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/bundle/appimage
+        run: |
+          set -euo pipefail
+          for image in "$APPIMAGE_DIR/"*.AppImage; do
+            # A sidecar alone cannot tell update clients where to find releases.
+            embedded="$("$image" --appimage-updateinformation)"
+            if [[ "$embedded" != "$LDAI_UPDATE_INFORMATION" ]]; then
+              echo "Missing or unexpected embedded update information in $image" >&2
+              exit 1
+            fi
+            zsyncmake -u "$(basename -- "$image")" -o "$image.zsync" "$image"
+          done
+
       - name: Stage portable package
         shell: bash
         run: bash scripts/release/stage-linux-portable.sh "${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release" "${{ matrix.arch }}"
@@ -264,6 +286,7 @@ jobs:
           name: codexmanager-linux-${{ matrix.arch }}
           path: |
             ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/bundle/**/*.AppImage
+            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/bundle/**/*.AppImage.zsync
             ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/bundle/**/*.deb
             ${{ env.CARGO_TARGET_DIR }}/${{ matrix.rust_target }}/release/portable/*.zip
           if-no-files-found: error

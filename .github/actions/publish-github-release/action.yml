@@ -68,7 +68,7 @@ runs:
         trap 'rm -f "$NOTES_FILE"' EXIT
         bash scripts/release/generate-release-notes.sh "$TAG" "$GH_REPO" docs/zh-CN/CHANGELOG.md > "$NOTES_FILE"
         mapfile -t FILES < <(find "$ASSETS_DIR" -type f \( \
-          -name '*.exe' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' \
+          -name '*.exe' -o -name '*.zip' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.AppImage.zsync' -o -name '*.deb' \
         \) | sort)
         if [ "${#FILES[@]}" -eq 0 ]; then
           echo "No release assets found."
