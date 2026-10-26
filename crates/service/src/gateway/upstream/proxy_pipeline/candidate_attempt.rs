@@ -74,7 +74,9 @@ pub(in super::super) async fn run_candidate_attempt(
 
     let executor_kind = resolve_gateway_upstream_executor_kind(context.protocol_type());
 
-    let attempt = execute_candidate_upstream_flow(
+    // Keep the large executor state off the stack before cancellation and
+    // request-scope wrappers move and poll it.
+    let attempt = Box::pin(execute_candidate_upstream_flow(
         executor_kind,
         storage,
         method,
@@ -101,11 +103,30 @@ pub(in super::super) async fn run_candidate_attempt(
             super::super::super::record_route_quality(&account.id, status_code);
             context.log_attempt_result(&account.id, upstream_url, status_code, error);
         },
-    );
-    crate::http::gateway_request::with_response_cancellation(attempt)
-        .await
-        .unwrap_or_else(|()| CandidateUpstreamDecision::Terminal {
-            status_code: 499,
-            message: "downstream request cancelled".to_owned(),
-        })
+    ));
+    let attempt = crate::http::gateway_request::with_response_cancellation(attempt);
+    let result = match request_ctx.replay_guard {
+        Some(guard) => {
+            crate::http::gateway_replay_guard::scope_upstream_replay_guard(guard.clone(), attempt)
+                .await
+        }
+        None => attempt.await,
+    };
+    let decision = match result {
+        Ok(decision) => decision,
+        Err(()) => {
+            return CandidateUpstreamDecision::Terminal {
+                status_code: 499,
+                message: "downstream request cancelled".to_owned(),
+            }
+        }
+    };
+    if request_ctx.replay_is_blocked() {
+        return CandidateUpstreamDecision::Terminal {
+            status_code: 502,
+            message: crate::http::gateway_replay_guard::AMBIGUOUS_UPSTREAM_DELIVERY_MESSAGE
+                .to_owned(),
+        };
+    }
+    decision
 }

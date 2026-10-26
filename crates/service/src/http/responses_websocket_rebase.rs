@@ -1,6 +1,8 @@
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use super::responses_websocket_control::{is_interrupted_response, is_retained_interrupted_output};
+
 const MAX_CACHED_WS_TOOL_CALLS: usize = 256;
 const MAX_CACHED_WS_RESPONSES: usize = 64;
 const MAX_CACHED_WS_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -47,6 +49,18 @@ pub(super) struct CompletedWsToolCallCache {
     insertion_order: VecDeque<WsToolCallKey>,
 }
 
+pub(super) enum WsToolCallCacheEvent {
+    Item(Value),
+    InterruptedItem {
+        item_id: Option<String>,
+        call_id: Option<String>,
+    },
+    Terminal {
+        tools: Vec<Value>,
+        interrupted: bool,
+    },
+}
+
 #[derive(Clone)]
 struct CompletedWsResponse {
     previous_response_id: Option<String>,
@@ -79,10 +93,8 @@ impl WsToolCallKind {
 }
 
 impl CompletedWsToolCallCache {
-    pub(super) fn observe_upstream_event(&mut self, text: &str) {
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
-            return;
-        };
+    pub(super) fn parse_upstream_event(text: &str) -> Option<WsToolCallCacheEvent> {
+        let value = serde_json::from_str::<Value>(text).ok()?;
         let event_type = value
             .get("type")
             .and_then(Value::as_str)
@@ -91,22 +103,83 @@ impl CompletedWsToolCallCache {
             .to_ascii_lowercase();
         match event_type.as_str() {
             "response.output_item.added" | "response.output_item.done" => {
-                if let Some(item) = value.get("item") {
-                    self.insert(item);
-                }
+                let item = value.get("item")?;
+                normalize_ws_tool_call_item(item)?;
+                Some(WsToolCallCacheEvent::Item(item.clone()))
             }
-            "response.completed" => {
-                if let Some(items) = value
-                    .get("response")
-                    .and_then(|response| response.get("output"))
+            "response.output_item.interrupted" => {
+                let item_id = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.pointer("/item/id").and_then(Value::as_str));
+                let call_id = value
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.pointer("/item/call_id").and_then(Value::as_str));
+                (item_id.is_some() || call_id.is_some()).then(|| {
+                    WsToolCallCacheEvent::InterruptedItem {
+                        item_id: item_id.map(str::to_string),
+                        call_id: call_id.map(str::to_string),
+                    }
+                })
+            }
+            "response.completed" | "response.incomplete"
+                if event_type == "response.completed" || is_interrupted_response(&value) =>
+            {
+                let interrupted = is_interrupted_response(&value);
+                let tools = value
+                    .pointer("/response/output")
                     .and_then(Value::as_array)
-                {
-                    for item in items {
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| normalize_ws_tool_call_item(item).is_some())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                // An interrupted terminal also removes old partial calls even
+                // if its final output is empty. Other text-only events have no
+                // registry work and must not contend with active tool sessions.
+                (interrupted || !tools.is_empty())
+                    .then_some(WsToolCallCacheEvent::Terminal { tools, interrupted })
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn observe_upstream_event(&mut self, text: &str) {
+        if let Some(event) = Self::parse_upstream_event(text) {
+            self.observe_parsed_upstream_event(&event);
+        }
+    }
+
+    pub(super) fn observe_parsed_upstream_event(&mut self, event: &WsToolCallCacheEvent) {
+        match event {
+            WsToolCallCacheEvent::Item(item) => self.insert(item),
+            WsToolCallCacheEvent::InterruptedItem { item_id, call_id } => {
+                self.calls.retain(|key, item| {
+                    !item_id
+                        .as_deref()
+                        .is_some_and(|id| item.get("id").and_then(Value::as_str) == Some(id))
+                        && !call_id.as_deref().is_some_and(|id| key.call_id == id)
+                });
+                self.insertion_order
+                    .retain(|key| self.calls.contains_key(key));
+            }
+            WsToolCallCacheEvent::Terminal { tools, interrupted } => {
+                if *interrupted {
+                    self.calls
+                        .retain(|_, item| is_retained_interrupted_output(item));
+                    self.insertion_order
+                        .retain(|key| self.calls.contains_key(key));
+                }
+                for item in tools {
+                    if !*interrupted || is_retained_interrupted_output(item) {
                         self.insert(item);
+                    } else if let Some((key, _)) = normalize_ws_tool_call_item(item) {
+                        self.calls.remove(&key);
+                        self.insertion_order.retain(|existing| existing != &key);
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -180,7 +253,7 @@ impl CompletedWsResponseCache {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        if event_type != "response.completed" {
+        if event_type != "response.completed" && !is_interrupted_response(&terminal) {
             return Ok(false);
         }
         let response = terminal
@@ -194,13 +267,16 @@ impl CompletedWsResponseCache {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "completed websocket response is missing a non-empty id".to_string())?
             .to_string();
-        let output = response
+        let mut output = response
             .get("output")
             .and_then(Value::as_array)
             .cloned()
             .ok_or_else(|| {
                 format!("completed websocket response {response_id} is missing output array")
             })?;
+        if is_interrupted_response(&terminal) {
+            output.retain(is_retained_interrupted_output);
+        }
         let input = normalize_ws_response_input(input);
         let previous_response_id = previous_response_id
             .map(str::trim)

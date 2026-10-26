@@ -31,8 +31,12 @@ use crate::http::codex_source::{
 use crate::http::proxy_response::{text_error_response, text_response};
 use crate::storage_helpers::open_storage;
 
+#[path = "responses_websocket_control.rs"]
+mod responses_websocket_control;
 #[path = "responses_websocket_rebase.rs"]
 mod responses_websocket_rebase;
+
+use responses_websocket_control::{is_interrupted_response, parse_client_message, ClientMessage};
 
 use responses_websocket_rebase::{
     expand_response_create_previous_response, normalize_ws_tool_call_outputs,
@@ -117,6 +121,7 @@ struct PendingWsRequestState {
     buffer_retry_preamble: bool,
     attempted_account_ids: HashSet<String>,
     retried_missing_tool_call_context: bool,
+    interrupt_requested: bool,
 }
 
 type UpstreamWebsocketStream =
@@ -418,6 +423,14 @@ fn store_ws_tool_call_registry(
     if observed.is_empty() {
         return;
     }
+    update_ws_tool_call_registry(context, prepared, |calls| calls.merge_from(observed));
+}
+
+fn update_ws_tool_call_registry(
+    context: &WsRequestContext,
+    prepared: &PreparedClientFrame,
+    update: impl FnOnce(&mut CompletedWsToolCallCache),
+) {
     let Some(key) = ws_tool_call_registry_key(context, prepared) else {
         return;
     };
@@ -438,12 +451,12 @@ fn store_ws_tool_call_registry(
                 last_used_at: now,
                 retained_bytes: 0,
             });
-        entry.calls.merge_from(observed);
+        update(&mut entry.calls);
         entry.last_used_at = now;
         entry.retained_bytes = entry.calls.estimated_bytes();
         entry.retained_bytes
     };
-    if retained_bytes > RESPONSES_WS_MAX_TOOL_CALL_ENTRY_BYTES {
+    if retained_bytes == 0 || retained_bytes > RESPONSES_WS_MAX_TOOL_CALL_ENTRY_BYTES {
         registries.remove(&key);
         return;
     }
@@ -497,14 +510,19 @@ fn remember_ws_tool_calls_from_upstream_event(
     prepared: &PreparedClientFrame,
     text: &str,
 ) {
-    let mut observed = CompletedWsToolCallCache::default();
-    observed.observe_upstream_event(text);
-    store_ws_tool_call_registry(context, prepared, &observed);
+    let Some(event) = CompletedWsToolCallCache::parse_upstream_event(text) else {
+        return;
+    };
+    // Apply removals to the stored cache itself. Merging an empty per-event
+    // cache cannot remove a partial call saved by output_item.added earlier.
+    update_ws_tool_call_registry(context, prepared, |calls| {
+        calls.observe_parsed_upstream_event(&event)
+    });
 }
 
 async fn run_responses_websocket_session(mut socket: WebSocket, context: WsRequestContext) {
-    let first_text = match receive_initial_request(&mut socket).await {
-        Ok(Some(text)) => text,
+    let (first_text, first_payload) = match receive_initial_request(&mut socket).await {
+        Ok(Some(frame)) => frame,
         Ok(None) => return,
         Err(err) => {
             send_ws_error_and_close(&mut socket, err, context.prefer_raw_errors).await;
@@ -518,15 +536,20 @@ async fn run_responses_websocket_session(mut socket: WebSocket, context: WsReque
         return;
     }
 
-    let prepared_first =
-        match rewrite_client_frame_with_model_fast_policy(first_text.as_str(), &context).await {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                record_rejected_ws_request(&context, &err, Some(first_text.as_str()));
-                send_ws_error_and_close(&mut socket, err, context.prefer_raw_errors).await;
-                return;
-            }
-        };
+    let prepared_first = match rewrite_client_frame_with_model_fast_policy(
+        first_text.as_str(),
+        first_payload,
+        &context,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            record_rejected_ws_request(&context, &err, Some(first_text.as_str()));
+            send_ws_error_and_close(&mut socket, err, context.prefer_raw_errors).await;
+            return;
+        }
+    };
 
     let mut completed_tool_calls = if ws_request_has_tool_call_output(prepared_first.text.as_str())
     {
@@ -580,6 +603,7 @@ async fn run_responses_websocket_session(mut socket: WebSocket, context: WsReque
         ),
         attempted_account_ids: first_attempted_account_ids,
         retried_missing_tool_call_context: false,
+        interrupt_requested: false,
     };
 
     let mut completed_responses = CompletedWsResponseCache::default();
@@ -713,7 +737,33 @@ async fn run_responses_websocket_session(mut socket: WebSocket, context: WsReque
                 };
                 match client_result {
                     Ok(Message::Text(text)) => {
-                        match rewrite_client_frame(text.as_str(), &context) {
+                        let payload = match parse_client_message(text.as_str()) {
+                            Ok(ClientMessage::Interrupt) => {
+                                // Interrupt is a control message for this exact upstream session.
+                                // Never rewrite it, select another account, or replay the create
+                                // it cancels. Keep pending until the upstream terminal event; the
+                                // interrupt acknowledgement alone does not complete a response.
+                                if let Some(pending) = pending_request.as_mut() {
+                                    pending.interrupt_requested = true;
+                                }
+                                if let Err(err) = upstream.stream.send(
+                                    UpstreamMessage::Text(text.to_string().into())
+                                ).await {
+                                    log::warn!("event=responses_ws_interrupt_send_failed err={err}");
+                                    // Let the existing disconnect path finish the pending log and
+                                    // report the transport failure without retrying generation.
+                                    let _ = upstream.stream.close(None).await;
+                                }
+                                continue;
+                            }
+                            Ok(ClientMessage::Create(payload)) => payload,
+                            Err(err) => {
+                                send_ws_error_and_close(&mut socket, err, context.prefer_raw_errors).await;
+                                let _ = upstream.stream.close(None).await;
+                                break;
+                            }
+                        };
+                        match rewrite_response_create(text.as_str(), payload, &context) {
                             Ok(prepared) => {
                                 if pending_request.is_some() {
                                     log::warn!(
@@ -795,6 +845,7 @@ async fn run_responses_websocket_session(mut socket: WebSocket, context: WsReque
                                     buffer_retry_preamble,
                                     attempted_account_ids,
                                     retried_missing_tool_call_context: false,
+                                    interrupt_requested: false,
                                 };
                                 let (must_reselect_account, fresh_conversation_routing, fresh_route_strategy, fresh_route_source) = match ws_collect_routed_candidates(
                                     &context,
@@ -1603,7 +1654,9 @@ async fn validate_ws_api_key_for_new_request(
     })?
 }
 
-async fn receive_initial_request(socket: &mut WebSocket) -> Result<Option<String>, WsSessionError> {
+async fn receive_initial_request(
+    socket: &mut WebSocket,
+) -> Result<Option<(String, Value)>, WsSessionError> {
     let mut heartbeat = responses_ws_heartbeat_interval();
     loop {
         let message = tokio::select! {
@@ -1622,7 +1675,12 @@ async fn receive_initial_request(socket: &mut WebSocket) -> Result<Option<String
             }
         };
         match message {
-            Ok(Message::Text(text)) => return Ok(Some(text.to_string())),
+            Ok(Message::Text(text)) => match parse_client_message(text.as_str())? {
+                ClientMessage::Create(payload) => return Ok(Some((text.to_string(), payload))),
+                // Before a create, or after an idle upstream disconnect, there is
+                // no active upstream response to interrupt. Keep waiting for create.
+                ClientMessage::Interrupt => continue,
+            },
             Ok(Message::Ping(payload)) => {
                 let _ = socket.send(Message::Pong(payload)).await;
             }
@@ -1664,9 +1722,10 @@ fn responses_ws_heartbeat_interval() -> tokio::time::Interval {
 
 async fn rewrite_client_frame_with_model_fast_policy(
     text: &str,
+    payload: Value,
     context: &WsRequestContext,
 ) -> Result<PreparedClientFrame, WsSessionError> {
-    let prepared = rewrite_client_frame(text, context)?;
+    let prepared = rewrite_response_create(text, payload, context)?;
     apply_model_fast_policy(prepared).await
 }
 
@@ -1766,38 +1825,33 @@ fn apply_model_fast_policy_with_storage(
     Ok(prepared)
 }
 
+#[cfg(test)]
 fn rewrite_client_frame(
     text: &str,
     context: &WsRequestContext,
 ) -> Result<PreparedClientFrame, WsSessionError> {
+    match parse_client_message(text)? {
+        ClientMessage::Create(payload) => rewrite_response_create(text, payload, context),
+        ClientMessage::Interrupt => Err(WsSessionError::bad_request_bilingual(
+            "中断控制帧不能作为生成请求重写",
+            "interrupt control frames cannot be rewritten as response.create requests",
+        )),
+    }
+}
+
+fn rewrite_response_create(
+    text: &str,
+    mut payload: Value,
+    context: &WsRequestContext,
+) -> Result<PreparedClientFrame, WsSessionError> {
     let raw_body = bytes::Bytes::copy_from_slice(text.as_bytes());
-    let mut payload = serde_json::from_str::<Value>(text).map_err(|err| {
-        WsSessionError::bad_request_bilingual(
-            "WebSocket JSON 载荷无效",
-            format!("invalid websocket json payload: {err}"),
-        )
-    })?;
     let Some(object) = payload.as_object_mut() else {
         return Err(WsSessionError::bad_request_bilingual(
             "WebSocket 载荷必须是 JSON 对象",
             "websocket payload must be a JSON object",
         ));
     };
-    let message_type = object
-        .remove("type")
-        .and_then(|value| value.as_str().map(str::to_string))
-        .ok_or_else(|| {
-            WsSessionError::bad_request_bilingual(
-                "WebSocket 载荷缺少 type=response.create",
-                "websocket payload missing type=response.create",
-            )
-        })?;
-    if message_type != "response.create" {
-        return Err(WsSessionError::bad_request_bilingual(
-            "不支持的 WebSocket 消息类型",
-            format!("unsupported websocket message type: {message_type}"),
-        ));
-    }
+    object.remove("type");
 
     let service_tier_diagnostic =
         crate::gateway::inspect_service_tier_value(object.get("service_tier"));
@@ -2481,7 +2535,8 @@ async fn retry_pending_request_after_upstream_disconnect(
     completed_tool_calls: &CompletedWsToolCallCache,
     reason: &str,
 ) -> Result<bool, WsSessionError> {
-    if pending.forwarded_non_preamble_event
+    if pending.interrupt_requested
+        || pending.forwarded_non_preamble_event
         || pending.upstream_disconnect_recovery_attempts
             >= RESPONSES_WS_MAX_PRE_COMPLETION_RECOVERY_ATTEMPTS
     {
@@ -2525,17 +2580,18 @@ async fn wait_for_client_request_and_reconnect_upstream(
     completed_responses: &CompletedWsResponseCache,
     completed_tool_calls: &CompletedWsToolCallCache,
 ) -> Result<Option<(ConnectedUpstreamWebsocket, PendingWsRequestState)>, WsSessionError> {
-    let Some(text) = receive_initial_request(socket).await? else {
+    let Some((text, payload)) = receive_initial_request(socket).await? else {
         return Ok(None);
     };
     validate_ws_api_key_for_new_request(context).await?;
-    let prepared = match rewrite_client_frame_with_model_fast_policy(text.as_str(), context).await {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            record_rejected_ws_request(context, &err, Some(text.as_str()));
-            return Err(err);
-        }
-    };
+    let prepared =
+        match rewrite_client_frame_with_model_fast_policy(text.as_str(), payload, context).await {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                record_rejected_ws_request(context, &err, Some(text.as_str()));
+                return Err(err);
+            }
+        };
     let mut pending = PendingWsRequestState {
         log: begin_ws_request_log(context, &prepared, "unresolved", "upstream_reconnect"),
         prepared,
@@ -2548,6 +2604,7 @@ async fn wait_for_client_request_and_reconnect_upstream(
         buffer_retry_preamble: false,
         attempted_account_ids: HashSet::new(),
         retried_missing_tool_call_context: false,
+        interrupt_requested: false,
     };
     match reconnect_upstream_for_pending_request(
         context,
@@ -3847,7 +3904,11 @@ async fn try_retry_ws_request_after_terminal(
     completed_responses: &CompletedWsResponseCache,
     completed_tool_calls: &CompletedWsToolCallCache,
 ) -> Result<bool, WsSessionError> {
-    if !should_attempt_ws_terminal_retry(terminal.status_code, pending.forwarded_non_preamble_event)
+    if pending.interrupt_requested
+        || !should_attempt_ws_terminal_retry(
+            terminal.status_code,
+            pending.forwarded_non_preamble_event,
+        )
     {
         return Ok(false);
     }
@@ -4090,6 +4151,16 @@ fn inspect_ws_terminal_event(text: &str) -> Option<WsTerminalEvent> {
             error: error.or(error_code),
             is_usage_limit: false,
             is_websocket_connection_limit,
+        }),
+        // Codex treats an interrupted response as a completed turn with
+        // end_turn=false. Preserve its response id/history for the next create;
+        // this is deliberate steering, not an upstream availability failure.
+        "response.incomplete" if is_interrupted_response(&value) => Some(WsTerminalEvent {
+            status_code: 200,
+            usage: parse_ws_usage(&value),
+            error: None,
+            is_usage_limit: false,
+            is_websocket_connection_limit: false,
         }),
         "response.incomplete" => Some(WsTerminalEvent {
             status_code: 502,

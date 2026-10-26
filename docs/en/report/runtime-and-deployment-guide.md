@@ -52,6 +52,21 @@ supports_websockets = true
 
 - If you changed the service port in Settings, update `base_url` accordingly.
 - In Docker / Web mode, use the browser-accessible Web address plus `/v1`, such as `http://10.10.121.253:48761/v1`, rather than the container's internal service address.
+- With an upstream that supports Codex generation interrupts, Responses WebSocket forwards interrupt control frames and supports subsequent requests on the same session. An upstream `response.incomplete` with reason `interrupted` records normal interruption usage and retains completed context for the next request; other upstream failures and disconnects remain errors.
+
+### Account still displayed, or request logs show 499
+
+Connecting through CodexManager preserves Codex's sign-in state, so Codex may still display the existing ChatGPT account. Model requests use the selected provider's `base_url` and platform key. The account label alone does not establish that requests bypass the gateway, and there is no need to delete `auth.json` or sign out for this reason.
+
+Confirm that Codex and CodexManager use the same `CODEX_HOME`, restart Codex after applying the configuration, and correlate requests by time in the gateway logs. A request recorded by CodexManager has reached the gateway; its upstream address identifies the route selected by the gateway.
+
+Status `499` with `response write failed: broken pipe` or `downstream HTTP body closed` means the downstream client closed the response connection. Possible causes include stopping a turn, changing sessions, or a network disconnect; this is different from a `401/403` authentication failure. If Codex also reports an error, retain that turn's client error, timestamp, and matching gateway record to distinguish cancellation, network issues, and upstream failures. A screenshot showing only `499` cannot establish why the client disconnected.
+
+Status `499` does not establish that the upstream did no work or consumed no quota. Codex can also stop reading after receiving a complete `response.completed` while the upstream HTTP stream remains open, producing this write error. Distinguish connection cleanup after a completed result from retries after an interrupted generation, and count all requests from the start of the operation through its eventual success. The gateway list stores one final record per client request; check that request's upstream attempts separately in its details.
+
+The account's five-hour quota comes from the official usage endpoint, not a conversion of local request-log tokens. When upstream usage is unavailable, the gateway estimates input tokens as roughly one quarter of the request JSON's character count. This includes request structure overhead and cannot establish actual model usage or official quota consumption. Nonzero cached tokens come from upstream usage and are already included in input tokens; do not add them again. When investigating a quota drop across failed attempts and eventual success, correlate usage refresh times for the same account, client retry records, and each request's trace ID, upstream attempt count, and usage source. The final success record or number of `499` records alone cannot determine additional consumption.
+
+To avoid duplicate submissions, if a connection closes or response headers time out while establishing the upstream HTTP response and delivery is uncertain, CM stops automatic retries, account failover, and fallback routes within that request, and reports that the upstream may already have processed it. Failures known to occur before connection establishment remain recoverable, as do existing recovery flows for explicit rejection responses. A subsequent client retry is a new request and may resend the full context; this protection does not guarantee that failed requests consume no official quota.
 
 ## Import and export
 - `Batch import`: select multiple `.json/.txt` files and import them together.

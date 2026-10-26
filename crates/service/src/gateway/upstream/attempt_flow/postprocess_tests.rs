@@ -238,6 +238,7 @@ fn agent_identity_invalid_task_recovery_replays_once_without_oauth_fallback() {
         protocol_type: crate::apikey_profile::PROTOCOL_OPENAI_COMPAT,
         is_fedramp: true,
         capture: None,
+        replay_guard: None,
     };
     let incoming_headers = IncomingHeaderSnapshot::default();
     let body = Bytes::from_static(br#"{"model":"gpt-5.5","input":"hello"}"#);
@@ -358,6 +359,7 @@ fn chatgpt_responses_400_retries_same_path_without_session_headers() {
         protocol_type: crate::apikey_profile::PROTOCOL_OPENAI_COMPAT,
         is_fedramp: false,
         capture: None,
+        replay_guard: None,
     };
     let body = Bytes::from_static(
         br#"{"model":"gpt-5.5","input":"hello","prompt_cache_key":"thread-current"}"#,
@@ -466,6 +468,7 @@ fn chatgpt_responses_failed_stateless_retry_keeps_original_400() {
         protocol_type: crate::apikey_profile::PROTOCOL_OPENAI_COMPAT,
         is_fedramp: false,
         capture: None,
+        replay_guard: None,
     };
     let body = Bytes::from_static(
         br#"{"model":"gpt-5.5","input":"hello","prompt_cache_key":"thread-current"}"#,
@@ -581,6 +584,7 @@ fn chatgpt_responses_stripped_candidate_does_not_retry_without_session_headers_a
         protocol_type: crate::apikey_profile::PROTOCOL_OPENAI_COMPAT,
         is_fedramp: false,
         capture: None,
+        replay_guard: None,
     };
     let body = Bytes::from_static(
         br#"{"model":"gpt-5.5","input":"hello","prompt_cache_key":"thread-current"}"#,
@@ -693,6 +697,7 @@ fn retries_server_error_once_before_final_decision() {
         protocol_type: crate::apikey_profile::PROTOCOL_OPENAI_COMPAT,
         is_fedramp: false,
         capture: None,
+        replay_guard: None,
     };
     let body = Bytes::from_static(br#"{"model":"gpt-5.3-codex","input":"hello"}"#);
     let upstream = crate::gateway::run_upstream_io(super::super::transport::send_upstream_request(
@@ -800,6 +805,7 @@ fn chatgpt_challenge_on_last_candidate_retries_without_same_account_failover() {
         protocol_type: crate::apikey_profile::PROTOCOL_OPENAI_COMPAT,
         is_fedramp: false,
         capture: None,
+        replay_guard: None,
     };
     let body = Bytes::from_static(br#"{"model":"gpt-5.3-codex","input":"hello"}"#);
     let upstream = crate::gateway::run_upstream_io(super::super::transport::send_upstream_request(
@@ -911,6 +917,7 @@ fn chatgpt_cloudflare_challenge_directly_failovers_without_same_account_retry() 
         protocol_type: crate::apikey_profile::PROTOCOL_OPENAI_COMPAT,
         is_fedramp: false,
         capture: None,
+        replay_guard: None,
     };
     let body = Bytes::from_static(br#"{"model":"gpt-5.3-codex","input":"hello"}"#);
     let send_started_at = std::time::Instant::now();
@@ -1021,6 +1028,7 @@ fn cloudflare_cf_ray_directly_failovers_without_same_account_retry() {
         protocol_type: crate::apikey_profile::PROTOCOL_OPENAI_COMPAT,
         is_fedramp: false,
         capture: None,
+        replay_guard: None,
     };
     let body = Bytes::from_static(br#"{"model":"gpt-5.3-codex","input":"hello"}"#);
     let upstream = crate::gateway::run_upstream_io(super::super::transport::send_upstream_request(

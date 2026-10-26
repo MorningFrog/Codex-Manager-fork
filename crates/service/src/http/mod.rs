@@ -1,6 +1,7 @@
 pub(crate) mod account_test_events;
 pub mod callback_endpoint;
 pub mod gateway_endpoint;
+pub(crate) mod gateway_replay_guard;
 pub(crate) mod gateway_request;
 pub(crate) mod gateway_response;
 pub(crate) mod gateway_response_body;

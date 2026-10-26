@@ -520,15 +520,19 @@ pub(in super::super) async fn execute_candidate_sequence(
                 status_code,
                 message,
             } => {
-                if should_failover_terminal_gateway_error(
-                    context,
-                    &account.id,
-                    context.has_more_candidates(idx),
-                    &message,
-                    &mut attempt_trace,
-                    &mut last_attempt_url,
-                    &mut last_attempt_error,
-                ) {
+                if !request
+                    .as_ref()
+                    .is_some_and(|request| request.upstream_replay_guard().is_blocked())
+                    && should_failover_terminal_gateway_error(
+                        context,
+                        &account.id,
+                        context.has_more_candidates(idx),
+                        &message,
+                        &mut attempt_trace,
+                        &mut last_attempt_url,
+                        &mut last_attempt_error,
+                    )
+                {
                     if context.protocol_type() == crate::apikey_profile::PROTOCOL_ANTHROPIC_NATIVE
                         && is_challenge_failover_error(Some(message.as_str()))
                     {

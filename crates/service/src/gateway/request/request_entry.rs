@@ -12,7 +12,16 @@ use crate::http::gateway_response::Response;
 ///
 /// # 返回
 /// 返回函数执行结果
-pub(crate) async fn handle_gateway_request_async(mut request: Request) -> Result<(), String> {
+pub(crate) async fn handle_gateway_request_async(request: Request) -> Result<(), String> {
+    let replay_guard = request.upstream_replay_guard().clone();
+    crate::http::gateway_replay_guard::scope_upstream_replay_guard(
+        replay_guard,
+        Box::pin(handle_gateway_request_inner(request)),
+    )
+    .await
+}
+
+async fn handle_gateway_request_inner(mut request: Request) -> Result<(), String> {
     // 处理代理请求（鉴权后转发到上游）
     let debug = super::DEFAULT_GATEWAY_DEBUG;
     if request.method().as_str() == "OPTIONS" {

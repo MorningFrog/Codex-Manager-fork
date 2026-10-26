@@ -21,6 +21,7 @@ enum UpstreamObservation {
     CaptureDelivered(usize),
     ControlWake(usize),
     ClosedBeforeHeaders(usize),
+    ClosedAfterBody(usize),
     Incomplete(usize, String),
     AcceptClosed,
     ReaderPanicked(usize),
@@ -66,6 +67,13 @@ impl Drop for ReleaseCaptureOnDrop {
     }
 }
 
+#[derive(Clone)]
+struct HeaderTimeoutBehavior {
+    healthy_token: Option<String>,
+    close_after_body: bool,
+    force_healthy: Arc<std::sync::atomic::AtomicBool>,
+}
+
 struct HeaderTimeoutUpstream {
     addr: String,
     requests: Receiver<(usize, CapturedUpstreamRequest)>,
@@ -73,6 +81,7 @@ struct HeaderTimeoutUpstream {
     stop: mpsc::Sender<()>,
     finished: Receiver<Result<(), String>>,
     capture_gate: Arc<CaptureGate>,
+    force_healthy: Arc<std::sync::atomic::AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -90,9 +99,31 @@ impl HeaderTimeoutUpstream {
         capture_open: bool,
         panic_reader: Option<usize>,
     ) -> Self {
+        Self::start_with_behavior(healthy_account, capture_open, panic_reader, false)
+    }
+
+    fn start_closing_after_body(healthy_account: Option<&str>) -> Self {
+        Self::start_with_behavior(healthy_account, true, None, true)
+    }
+
+    fn respond_healthy_to_all(&self) {
+        self.force_healthy.store(true, Ordering::Release);
+    }
+
+    fn start_with_behavior(
+        healthy_account: Option<&str>,
+        capture_open: bool,
+        panic_reader: Option<usize>,
+        close_after_body: bool,
+    ) -> Self {
         let listener = bind_test_listener("silent-header upstream");
         let addr = listener.local_addr().expect("upstream address").to_string();
-        let healthy_token = healthy_account.map(|id| format!("Bearer access_{id}"));
+        let force_healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let behavior = HeaderTimeoutBehavior {
+            healthy_token: healthy_account.map(|id| format!("Bearer access_{id}")),
+            close_after_body,
+            force_healthy: Arc::clone(&force_healthy),
+        };
         let (request_tx, requests) = mpsc::channel();
         let (event_tx, events) = mpsc::channel();
         let (ready_tx, ready) = mpsc::channel();
@@ -117,7 +148,7 @@ impl HeaderTimeoutUpstream {
                 readers.push(spawn_header_timeout_reader(
                     stream,
                     sequence,
-                    healthy_token.clone(),
+                    behavior.clone(),
                     request_tx.clone(),
                     event_tx.clone(),
                     Arc::clone(&worker_gate),
@@ -142,7 +173,7 @@ impl HeaderTimeoutUpstream {
                         readers.push(spawn_header_timeout_reader(
                             stream,
                             sequence,
-                            healthy_token.clone(),
+                            behavior.clone(),
                             request_tx.clone(),
                             event_tx.clone(),
                             Arc::clone(&worker_gate),
@@ -193,6 +224,7 @@ impl HeaderTimeoutUpstream {
             stop,
             finished,
             capture_gate,
+            force_healthy,
             join: Some(join),
         }
     }
@@ -274,7 +306,7 @@ impl Drop for HeaderTimeoutUpstream {
 fn spawn_header_timeout_reader(
     mut stream: TcpStream,
     sequence: usize,
-    healthy_token: Option<String>,
+    behavior: HeaderTimeoutBehavior,
     request_tx: mpsc::Sender<(usize, CapturedUpstreamRequest)>,
     events: mpsc::Sender<UpstreamObservation>,
     capture_gate: Arc<CaptureGate>,
@@ -299,9 +331,11 @@ fn spawn_header_timeout_reader(
                 return None;
             }
         };
-        let healthy = healthy_token
-            .as_ref()
-            .is_some_and(|token| captured.headers.get("authorization") == Some(token));
+        let healthy = behavior.force_healthy.load(Ordering::Acquire)
+            || behavior
+                .healthy_token
+                .as_ref()
+                .is_some_and(|token| captured.headers.get("authorization") == Some(token));
         assert!(!panic_on_capture, "injected upstream reader panic");
         capture_gate.wait();
         request_tx
@@ -325,6 +359,11 @@ fn spawn_header_timeout_reader(
                 .write_all(body.as_bytes())
                 .expect("write upstream SSE");
             stream.flush().expect("flush healthy upstream");
+            None
+        } else if behavior.close_after_body {
+            // The entire POST has reached the provider. Closing without any
+            // response headers leaves its inference/billing outcome unknown.
+            let _ = events.send(UpstreamObservation::ClosedAfterBody(sequence));
             None
         } else {
             Some(stream)
@@ -979,7 +1018,7 @@ fn assert_recorded_attempts_match_requests(
 }
 
 #[test]
-fn gateway_silent_response_headers_fail_over_when_total_timeout_disabled() {
+fn gateway_silent_response_headers_do_not_replay_to_a_healthy_account() {
     let _lock = test_env_guard();
     let dir = new_test_dir("codexmanager-header-timeout-failover");
     let db_path = dir.join("codexmanager.db");
@@ -1007,41 +1046,32 @@ fn gateway_silent_response_headers_fail_over_when_total_timeout_disabled() {
     server.join();
 
     report_header_timeout_context(&storage, &db_path, &upstream.addr, KEY_ID, elapsed);
-    assert_eq!(status, 200, "gateway response: {body}");
-    assert!(body.contains("healthy secondary answer"), "{body}");
-    assert!(body.contains("response.completed"), "{body}");
+    assert_eq!(status, 502, "gateway response: {body}");
+    assert!(body.contains("automatic replay stopped"), "{body}");
     assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
     let requests = upstream.finish_and_collect();
-    // The transport can retry with a fresh client, and the candidate layer can
-    // retry that account once. Assert bounded failover rather than requiring a
-    // particular number of recovery attempts before trying the healthy account.
-    assert!(
-        (2..=5).contains(&requests.len()),
-        "silent-account recovery must stay bounded: {requests:?}"
-    );
-    let (secondary_request, primary_requests) = requests.split_last().expect("upstream requests");
+    // Both accounts are available and the secondary would answer immediately.
+    // A timeout after a complete POST cannot prove the primary did not start
+    // inference, so neither a fresh-client retry nor account failover is safe.
     assert_eq!(
-        secondary_request.headers.get("authorization"),
-        Some(&format!("Bearer access_{SECONDARY}"))
+        requests.len(),
+        1,
+        "ambiguous request was replayed: {requests:?}"
     );
-    for request in primary_requests {
-        assert_eq!(
-            request.headers.get("authorization"),
-            Some(&format!("Bearer access_{PRIMARY}"))
-        );
-    }
-    for request in &requests {
-        assert_eq!(request.path, "/backend-api/codex/responses");
-    }
-    assert!(elapsed >= Duration::from_millis(STREAM_TIMEOUT_MS * primary_requests.len() as u64));
+    assert_eq!(
+        requests[0].headers.get("authorization"),
+        Some(&format!("Bearer access_{PRIMARY}"))
+    );
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    assert!(elapsed >= Duration::from_millis(STREAM_TIMEOUT_MS));
     let logs = storage
         .list_request_logs(Some(&format!("key:={KEY_ID}")), 10)
         .expect("read final request log");
     assert_eq!(logs.len(), 1, "{logs:?}");
     let log = &logs[0];
-    assert_eq!(log.status_code, Some(200));
+    assert_eq!(log.status_code, Some(502));
     assert_eq!(log.initial_account_id.as_deref(), Some(PRIMARY));
-    assert_eq!(log.account_id.as_deref(), Some(SECONDARY));
+    assert_eq!(log.account_id.as_deref(), Some(PRIMARY));
     assert_eq!(
         serde_json::from_str::<Vec<String>>(
             log.attempted_account_ids_json
@@ -1049,10 +1079,10 @@ fn gateway_silent_response_headers_fail_over_when_total_timeout_disabled() {
                 .expect("attempted accounts")
         )
         .expect("decode attempted accounts"),
-        vec![PRIMARY, SECONDARY]
+        vec![PRIMARY]
     );
     let trace_id = log.trace_id.as_deref().expect("request trace id");
-    assert_recorded_attempts_match_requests(&storage, trace_id, &requests, 5);
+    assert_recorded_attempts_match_requests(&storage, trace_id, &requests, 1);
 }
 
 #[test]
@@ -1093,17 +1123,15 @@ fn gateway_single_silent_account_still_obeys_stream_header_timeout() {
         elapsed,
     );
     assert_eq!(status, 502, "gateway response: {body}");
-    assert!(
-        body.contains("upstream response headers timed out after 200 ms"),
-        "{body}"
-    );
+    assert!(body.contains("automatic replay stopped"), "{body}");
     assert!(elapsed < Duration::from_secs(5), "elapsed: {elapsed:?}");
     let requests = upstream.finish_and_collect();
-    assert!(
-        (1..=2).contains(&requests.len()),
-        "single-account transport recovery must stay bounded: {requests:?}"
+    assert_eq!(
+        requests.len(),
+        1,
+        "ambiguous request was replayed: {requests:?}"
     );
-    assert!(elapsed >= Duration::from_millis(STREAM_TIMEOUT_MS * requests.len() as u64));
+    assert!(elapsed >= Duration::from_millis(STREAM_TIMEOUT_MS));
     assert!(requests.iter().all(|request| {
         request.headers.get("authorization").map(String::as_str)
             == Some("Bearer access_acc_header_timeout_only")
@@ -1117,5 +1145,319 @@ fn gateway_single_silent_account_still_obeys_stream_header_timeout() {
         .trace_id
         .as_deref()
         .expect("timeout request trace id");
-    assert_recorded_attempts_match_requests(&storage, trace_id, &requests, 2);
+    assert_recorded_attempts_match_requests(&storage, trace_id, &requests, 1);
+}
+
+fn post_long_inference(addr: &str, path: &str, stream: bool) -> (u16, String) {
+    let context = format!(
+        "{}REPLAY_GUARD_CONTEXT_END",
+        "long conversation context ".repeat(2048)
+    );
+    let mut request = serde_json::json!({
+        "model": "gpt-5.3-codex",
+        "stream": stream,
+    });
+    if path == "/v1/chat/completions" {
+        request["messages"] = serde_json::json!([{"role": "user", "content": context}]);
+        request["tools"] = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "capture_probe",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }]);
+    } else {
+        request["input"] = serde_json::json!([{"role": "user", "content": context}]);
+        request["tools"] = serde_json::json!([{
+            "type": "function",
+            "name": "capture_probe",
+            "parameters": {"type": "object", "properties": {}}
+        }]);
+    }
+    post_http_raw_with_read_timeout(
+        addr,
+        path,
+        &request.to_string(),
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &format!("Bearer {PLATFORM_KEY}")),
+        ],
+        FIXTURE_WAIT,
+    )
+}
+
+fn assert_captured_account(request: &CapturedUpstreamRequest, account: &str) {
+    assert_eq!(
+        request.headers.get("authorization"),
+        Some(&format!("Bearer access_{account}"))
+    );
+    assert_eq!(
+        request.headers.get("chatgpt-account-id"),
+        Some(&format!("chatgpt_{account}"))
+    );
+    assert_eq!(request.path, "/backend-api/codex/responses");
+}
+
+fn assert_complete_post_without_headers_is_not_replayed(path: &str, stream: bool, case: &str) {
+    let _lock = test_env_guard();
+    let dir = new_test_dir(&format!("codexmanager-no-header-replay-{case}"));
+    let db_path = dir.join("codexmanager.db");
+    let _db = EnvGuard::set("CODEXMANAGER_DB_PATH", db_path.to_string_lossy().as_ref());
+    let _route = EnvGuard::set("CODEXMANAGER_ROUTE_STRATEGY", "ordered");
+    let _health = EnvGuard::set("CODEXMANAGER_ROUTE_HEALTH_P2C_ENABLED", "0");
+    let _total = EnvGuard::set("CODEXMANAGER_UPSTREAM_TOTAL_TIMEOUT_MS", "0");
+    let _stream = EnvGuard::set("CODEXMANAGER_UPSTREAM_STREAM_TIMEOUT_MS", "2000");
+    let primary = format!("acc_no_headers_{case}_primary");
+    let secondary = format!("acc_no_headers_{case}_secondary");
+    let key_id = format!("gk_no_headers_{case}");
+    let mut upstream = HeaderTimeoutUpstream::start_closing_after_body(Some(&secondary));
+    let events = upstream.events.take().expect("no-header upstream events");
+    let _base = EnvGuard::set(
+        "CODEXMANAGER_UPSTREAM_BASE_URL",
+        &format!("http://{}/backend-api/codex", upstream.addr),
+    );
+    let storage = Storage::open(&db_path).expect("open db");
+    seed_accounts(&storage, &[&primary, &secondary], &key_id);
+    let server = codexmanager_service::start_one_shot_server().expect("start gateway");
+    let (status, body) = post_long_inference(&server.addr, path, stream);
+    server.join();
+    let requests = upstream.finish_and_collect();
+    let observations = events.iter().collect::<Vec<_>>();
+
+    assert_eq!(status, 502, "{case} gateway response: {body}");
+    assert!(
+        body.contains("automatic replay stopped"),
+        "{case}: ambiguous delivery must explain the replay stop: {body}"
+    );
+    assert!(observations.contains(&UpstreamObservation::BodyRead(1)));
+    assert!(observations.contains(&UpstreamObservation::ClosedAfterBody(1)));
+    assert_eq!(
+        requests.len(),
+        1,
+        "{case}: complete POST must not be resent to either account: {requests:?}"
+    );
+    assert_captured_account(&requests[0], &primary);
+    let decoded = decode_upstream_request_body(&requests[0]);
+    let decoded = std::str::from_utf8(&decoded).expect("decoded JSON request");
+    assert!(decoded.contains("REPLAY_GUARD_CONTEXT_END"));
+    assert!(decoded.contains("capture_probe"));
+    assert!(
+        decoded.len() > 48_000,
+        "fixture must receive the full long context"
+    );
+    let logs = storage
+        .list_request_logs(Some(&format!("key:={key_id}")), 10)
+        .expect("read no-header request log");
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    let log = &logs[0];
+    assert_eq!(log.status_code, Some(502));
+    assert_eq!(log.initial_account_id.as_deref(), Some(primary.as_str()));
+    assert_eq!(log.account_id.as_deref(), Some(primary.as_str()));
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(
+            log.attempted_account_ids_json
+                .as_deref()
+                .expect("attempted accounts")
+        )
+        .expect("decode attempted accounts"),
+        vec![primary]
+    );
+    assert_recorded_attempts_match_requests(
+        &storage,
+        log.trace_id.as_deref().expect("no-header trace id"),
+        &requests,
+        1,
+    );
+}
+
+#[test]
+fn gateway_complete_post_without_headers_is_not_replayed_for_responses_stream() {
+    assert_complete_post_without_headers_is_not_replayed("/v1/responses", true, "responses_stream");
+}
+
+#[test]
+fn gateway_complete_post_without_headers_is_not_replayed_for_responses_json() {
+    assert_complete_post_without_headers_is_not_replayed("/v1/responses", false, "responses_json");
+}
+
+#[test]
+fn gateway_complete_post_without_headers_is_not_replayed_for_chat_stream() {
+    assert_complete_post_without_headers_is_not_replayed(
+        "/v1/chat/completions",
+        true,
+        "chat_stream",
+    );
+}
+
+#[test]
+fn gateway_complete_post_without_headers_is_not_replayed_for_chat_json() {
+    assert_complete_post_without_headers_is_not_replayed(
+        "/v1/chat/completions",
+        false,
+        "chat_json",
+    );
+}
+
+#[test]
+fn gateway_no_header_replay_guard_does_not_leak_into_next_inbound_request() {
+    let _lock = test_env_guard();
+    let dir = new_test_dir("codexmanager-no-header-next-inbound");
+    let db_path = dir.join("codexmanager.db");
+    let _db = EnvGuard::set("CODEXMANAGER_DB_PATH", db_path.to_string_lossy().as_ref());
+    let _route = EnvGuard::set("CODEXMANAGER_ROUTE_STRATEGY", "ordered");
+    let _health = EnvGuard::set("CODEXMANAGER_ROUTE_HEALTH_P2C_ENABLED", "0");
+    let _total = EnvGuard::set("CODEXMANAGER_UPSTREAM_TOTAL_TIMEOUT_MS", "0");
+    let _stream = EnvGuard::set("CODEXMANAGER_UPSTREAM_STREAM_TIMEOUT_MS", "2000");
+    let upstream = HeaderTimeoutUpstream::start_closing_after_body(None);
+    let _base = EnvGuard::set(
+        "CODEXMANAGER_UPSTREAM_BASE_URL",
+        &format!("http://{}/backend-api/codex", upstream.addr),
+    );
+    let storage = Storage::open(&db_path).expect("open db");
+    let primary = "acc_no_headers_next_primary";
+    let secondary = "acc_no_headers_next_secondary";
+    let key_id = "gk_no_headers_next_inbound";
+    seed_accounts(&storage, &[primary, secondary], key_id);
+    let server = TestServer::start();
+    let first = post_long_inference(&server.addr, "/v1/responses", true);
+    assert_eq!(first.0, 502, "first inbound: {}", first.1);
+
+    // The client explicitly starts a second request on the same live service.
+    // Only this new inbound may submit the body again after the ambiguous EOF.
+    upstream.respond_healthy_to_all();
+    let second = post_long_inference(&server.addr, "/v1/responses", true);
+    assert_eq!(second.0, 200, "second inbound: {}", second.1);
+    assert!(
+        second.1.contains("healthy secondary answer"),
+        "{}",
+        second.1
+    );
+    drop(server);
+    let requests = upstream.finish_and_collect();
+    assert_eq!(
+        requests.len(),
+        2,
+        "exactly one POST per inbound: {requests:?}"
+    );
+    assert_captured_account(&requests[0], primary);
+    let logs = storage
+        .list_request_logs(Some(&format!("key:={key_id}")), 10)
+        .expect("read both inbound request logs");
+    assert_eq!(logs.len(), 2, "{logs:?}");
+    let failed = logs
+        .iter()
+        .find(|log| log.status_code == Some(502))
+        .expect("failed inbound log");
+    let success = logs
+        .iter()
+        .find(|log| log.status_code == Some(200))
+        .expect("successful inbound log");
+    assert_ne!(failed.trace_id, success.trace_id);
+    for (log, request) in [(failed, &requests[0]), (success, &requests[1])] {
+        assert_recorded_attempts_match_requests(
+            &storage,
+            log.trace_id.as_deref().expect("inbound trace id"),
+            std::slice::from_ref(request),
+            1,
+        );
+    }
+}
+
+#[test]
+fn gateway_connection_refused_before_post_can_fail_over_to_a_healthy_account() {
+    let _lock = test_env_guard();
+    let dir = new_test_dir("codexmanager-connect-refused-safe-failover");
+    let db_path = dir.join("codexmanager.db");
+    let _db = EnvGuard::set("CODEXMANAGER_DB_PATH", db_path.to_string_lossy().as_ref());
+    let _route = EnvGuard::set("CODEXMANAGER_ROUTE_STRATEGY", "ordered");
+    let _health = EnvGuard::set("CODEXMANAGER_ROUTE_HEALTH_P2C_ENABLED", "0");
+    let _total = EnvGuard::set("CODEXMANAGER_UPSTREAM_TOTAL_TIMEOUT_MS", "0");
+    // Windows may wait before reporting a refused loopback proxy connection.
+    // The connect deadline must expire before the response-header deadline so
+    // this fixture exercises a typed, known-before-send connection failure.
+    let _connect = EnvGuard::set("CODEXMANAGER_UPSTREAM_CONNECT_TIMEOUT_SECS", "1");
+    let _stream = EnvGuard::set("CODEXMANAGER_UPSTREAM_STREAM_TIMEOUT_MS", "3000");
+    let primary = "acc_connect_refused_primary";
+    let secondary = "acc_connect_refused_secondary";
+    let key_id = "gk_connect_refused";
+    let upstream = HeaderTimeoutUpstream::start(Some(secondary));
+    let _base = EnvGuard::set(
+        "CODEXMANAGER_UPSTREAM_BASE_URL",
+        &format!("http://{}/backend-api/codex", upstream.addr),
+    );
+    let storage = Storage::open(&db_path).expect("open db");
+    seed_accounts(&storage, &[primary, secondary], key_id);
+    let refused_listener = bind_test_listener("refused account proxy port");
+    let refused_proxy = format!(
+        "http://{}",
+        refused_listener.local_addr().expect("proxy address")
+    );
+    drop(refused_listener);
+    storage
+        .upsert_account_proxy_settings(
+            primary,
+            true,
+            Some("custom"),
+            None,
+            Some(&refused_proxy),
+            "unchecked",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("route only the primary through a refused proxy connection");
+    let server = codexmanager_service::start_one_shot_server().expect("start gateway");
+    let (status, body) = post_http_raw_with_read_timeout(
+        &server.addr,
+        "/v1/responses",
+        r#"{"model":"gpt-5.3-codex","input":"hello","stream":true}"#,
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &format!("Bearer {PLATFORM_KEY}")),
+        ],
+        Duration::from_secs(10),
+    );
+    server.join();
+    let requests = upstream.finish_and_collect();
+    assert_eq!(status, 200, "safe connect-refused failover: {body}");
+    assert!(body.contains("healthy secondary answer"), "{body}");
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the connected account can receive a POST: {requests:?}"
+    );
+    assert_captured_account(&requests[0], secondary);
+    let logs = storage
+        .list_request_logs(Some(&format!("key:={key_id}")), 10)
+        .expect("read safe failover log");
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    let log = &logs[0];
+    assert_eq!(log.status_code, Some(200));
+    assert_eq!(log.initial_account_id.as_deref(), Some(primary));
+    assert_eq!(log.account_id.as_deref(), Some(secondary));
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(
+            log.attempted_account_ids_json
+                .as_deref()
+                .expect("attempted accounts")
+        )
+        .expect("decode attempted accounts"),
+        vec![primary, secondary]
+    );
 }

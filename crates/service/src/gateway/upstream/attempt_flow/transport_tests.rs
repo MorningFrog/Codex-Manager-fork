@@ -435,6 +435,8 @@ fn report_transport_headers(
         Err(super::AsyncStreamRequestError::Request(_)) => "request_error",
         Err(super::AsyncStreamRequestError::WorkerLimit) => "worker_limit",
         Err(super::AsyncStreamRequestError::WorkerUnavailable(_)) => "worker_unavailable",
+        Err(super::AsyncStreamRequestError::ResponseMetadataUnavailable) => "metadata_unavailable",
+        Err(super::AsyncStreamRequestError::ReplayBlocked) => "replay_blocked",
     };
     eprintln!(
         "transport_client test={} phase={phase} elapsed={:?}",

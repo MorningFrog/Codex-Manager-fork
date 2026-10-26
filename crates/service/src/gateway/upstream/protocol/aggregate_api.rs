@@ -1661,6 +1661,13 @@ pub(in super::super) async fn proxy_aggregate_request(
                             last_failure_status = 499;
                             break 'candidates;
                         }
+                        if request
+                            .as_ref()
+                            .is_some_and(|request| request.upstream_replay_guard().is_blocked())
+                        {
+                            last_attempt_error = Some(crate::http::gateway_replay_guard::AMBIGUOUS_UPSTREAM_DELIVERY_MESSAGE.to_owned());
+                            break 'candidates;
+                        }
                         if attempt_idx < AGGREGATE_API_RETRY_ATTEMPTS_PER_CHANNEL {
                             continue;
                         }
@@ -1823,7 +1830,12 @@ pub(in super::super) async fn proxy_aggregate_request(
     let message =
         last_attempt_error.unwrap_or_else(|| "aggregate api upstream response failed".to_string());
     let status_code = last_failure_status;
-    if status_code != 499 && matches!(failure_policy, AggregateFailurePolicy::ReleaseRequest) {
+    if status_code != 499
+        && !request
+            .as_ref()
+            .is_some_and(|request| request.upstream_replay_guard().is_blocked())
+        && matches!(failure_policy, AggregateFailurePolicy::ReleaseRequest)
+    {
         if let Some(released_request) = request.take() {
             // 聚合优先混合轮转：聚合候选全部失败且请求尚未消费，
             // 将请求归还调用方，由其回落账号池。这里不能提前记录请求终态，

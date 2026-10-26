@@ -41,6 +41,148 @@ fn sample_api_key() -> ApiKey {
 }
 
 #[test]
+fn websocket_tool_registry_text_and_control_events_do_not_wait_for_registry_lock() {
+    let _guard = crate::test_env_guard();
+    let session_id = format!("registry-fast-path-{}-{}", std::process::id(), now_ts());
+    let mut headers = HeaderMap::new();
+    headers.insert("session_id", HeaderValue::from_str(&session_id).unwrap());
+    let context = WsRequestContext {
+        api_key: sample_api_key(),
+        incoming_headers: crate::gateway::IncomingHeaderSnapshot::from_http_headers(&headers),
+        prompt_cache_key: None,
+        cache_affinity_key: Some(session_id),
+        route_conversation_id: None,
+        route_conversation_source: None,
+        effective_upstream_base: "https://chatgpt.com/backend-api/codex".into(),
+        prefer_raw_errors: false,
+    };
+    let seed = rewrite_client_frame(
+        r#"{"type":"response.create","model":"gpt-6-luna","input":"hello"}"#,
+        &context,
+    )
+    .unwrap();
+    assert!(super::ws_tool_call_registry_key(&context, &seed).is_some());
+    let mutex = super::RESPONSES_WS_TOOL_CALL_REGISTRIES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let registry_lock = mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        for event in [
+            json!({"type": "response.created", "response": {"id": "resp_text"}}),
+            json!({"type": "response.output_text.delta", "delta": "token"}),
+            json!({"type": "response.interrupt.accepted", "response_id": "resp_text"}),
+            json!({"type": "response.interrupt.failed", "response_id": "resp_text", "error": {"message": "not active"}}),
+            json!({"type": "response.output_item.added", "item": {"type": "message", "role": "assistant", "content": []}}),
+            json!({"type": "response.completed", "response": {"id": "resp_text", "output": [{"type": "message", "content": []}]}}),
+            json!({"type": "response.incomplete", "response": {"incomplete_details": {"reason": "max_output_tokens"}}}),
+        ] {
+            remember_ws_tool_calls_from_upstream_event(&context, &seed, &event.to_string());
+        }
+        let _ = done_tx.send(());
+    });
+    let finished_without_registry = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+    // Release before joining or asserting so a regression fails without leaving
+    // a blocked worker or poisoning the process-wide registry mutex.
+    drop(registry_lock);
+    worker.join().unwrap();
+    assert!(
+        finished_without_registry.is_ok(),
+        "unrelated stream/control frames must skip the tool registry lock and cache serialization"
+    );
+}
+
+#[test]
+fn websocket_interrupt_prunes_partial_history_and_persisted_tool_registry() {
+    let _guard = crate::test_env_guard();
+    let session_id = format!("interrupt-cache-{}-{}", std::process::id(), now_ts());
+    let mut headers = HeaderMap::new();
+    headers.insert("session_id", HeaderValue::from_str(&session_id).unwrap());
+    let context = WsRequestContext {
+        api_key: sample_api_key(),
+        incoming_headers: crate::gateway::IncomingHeaderSnapshot::from_http_headers(&headers),
+        prompt_cache_key: None,
+        cache_affinity_key: Some(session_id),
+        route_conversation_id: None,
+        route_conversation_source: None,
+        effective_upstream_base: "https://chatgpt.com/backend-api/codex".into(),
+        prefer_raw_errors: false,
+    };
+    let seed = rewrite_client_frame(
+        r#"{"type":"response.create","model":"gpt-6-luna","input":"original prompt"}"#,
+        &context,
+    )
+    .unwrap();
+    let completed_call = json!({"type": "function_call", "id": "fc_finished", "call_id": "call_finished", "name": "echo", "arguments": "{}", "status": "completed"});
+    let unfinished_call = json!({"type": "function_call", "id": "fc_unfinished", "call_id": "call_unfinished", "name": "echo", "arguments": "{", "status": "in_progress"});
+    // Older snapshots may omit status; the item_id interruption must still
+    // remove this call instead of relying solely on terminal item status.
+    let discarded_call = json!({"type": "function_call", "id": "fc_discarded", "call_id": "call_discarded", "name": "echo", "arguments": "{"});
+    let mut local = CompletedWsToolCallCache::default();
+    let apply = |cache: &mut CompletedWsToolCallCache, event: Value| {
+        let text = event.to_string();
+        cache.observe_upstream_event(&text);
+        remember_ws_tool_calls_from_upstream_event(&context, &seed, &text);
+    };
+    for item in [&completed_call, &unfinished_call, &discarded_call] {
+        apply(
+            &mut local,
+            json!({"type": "response.output_item.added", "item": item}),
+        );
+    }
+    let rebase_output = |cache: &CompletedWsToolCallCache, call_id: &str| {
+        rebase_ws_request_for_account_change(
+            &json!({"type": "response.create", "model": "gpt-6-luna", "input": [
+                {"type": "function_call_output", "call_id": call_id, "output": "ok"}
+            ]})
+            .to_string(),
+            cache,
+        )
+    };
+    assert!(rebase_output(&local, "call_discarded").is_ok());
+    apply(
+        &mut local,
+        json!({"type": "response.output_item.interrupted", "item_id": "fc_discarded", "output_index": 2}),
+    );
+    assert!(rebase_output(&local, "call_discarded").is_err());
+    let stored = load_ws_tool_call_registry(&context, &seed).unwrap();
+    assert!(
+        rebase_output(&stored, "call_discarded").is_err(),
+        "an interrupted item must also be removed from the persisted registry"
+    );
+    let terminal = json!({
+        "type": "response.incomplete", "response": {
+            "id": "resp_interrupt_cache", "status": "incomplete", "incomplete_details": {"reason": "interrupted"},
+            "output": [completed_call,
+                {"type": "message", "role": "assistant", "status": "completed", "content": [{"type": "output_text", "text": "finished message"}]},
+                unfinished_call,
+                {"type": "reasoning", "id": "rs_partial", "status": "interrupted", "summary": [{"type": "summary_text", "text": "discard partial reasoning"}]}]
+        }
+    });
+    apply(&mut local, terminal.clone());
+    let stored = load_ws_tool_call_registry(&context, &seed).unwrap();
+    for cache in [&local, &stored] {
+        assert!(rebase_output(cache, "call_finished").is_ok());
+        assert!(rebase_output(cache, "call_unfinished").is_err());
+        assert!(rebase_output(cache, "call_discarded").is_err());
+    }
+    let mut history = CompletedWsResponseCache::default();
+    assert!(history
+        .observe_completed_response(&terminal.to_string(), None, &seed.input)
+        .unwrap());
+    let recovered = super::expand_response_create_previous_response(
+        &json!({"type": "response.create", "previous_response_id": "resp_interrupt_cache", "input": "continue"}).to_string(),
+        &history,
+    ).unwrap().unwrap();
+    assert!(recovered.contains("call_finished"));
+    assert!(recovered.contains("finished message"));
+    assert!(recovered.contains("original prompt"));
+    assert!(!recovered.contains("call_unfinished"));
+    assert!(!recovered.contains("discard partial reasoning"));
+}
+
+#[test]
 fn websocket_frame_applies_model_fast_policy() {
     let storage = Storage::open_in_memory().expect("open storage");
     storage.init().expect("init storage");

@@ -88,6 +88,7 @@ pub(crate) struct GatewayRequest {
     response: oneshot::Sender<Response<Body>>,
     cancellation: watch::Sender<bool>,
     cancelled: watch::Receiver<bool>,
+    upstream_replay_guard: super::gateway_replay_guard::UpstreamReplayGuard,
     lifetime_guards: Vec<Box<dyn Send>>,
     response_admission: Option<tokio::sync::SemaphorePermit<'static>>,
     completion: Option<oneshot::Receiver<()>>,
@@ -130,6 +131,7 @@ impl GatewayRequest {
                 response,
                 cancellation,
                 cancelled,
+                upstream_replay_guard: Default::default(),
                 lifetime_guards: Vec::new(),
                 response_admission: None,
                 completion: None,
@@ -160,6 +162,12 @@ impl GatewayRequest {
 
     pub(crate) fn is_cancelled(&self) -> bool {
         self.response.is_closed() || *self.cancelled.borrow()
+    }
+
+    pub(crate) fn upstream_replay_guard(
+        &self,
+    ) -> &super::gateway_replay_guard::UpstreamReplayGuard {
+        &self.upstream_replay_guard
     }
 
     pub(crate) fn cancellation_guard(&self) -> CancelResponseOnDrop {

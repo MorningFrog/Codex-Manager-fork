@@ -278,6 +278,11 @@ pub(super) async fn try_openai_fallback(
         .await
         {
             Ok(resp) => resp,
+            Err(first_err) if !first_err.can_retry_connect() => {
+                let duration_ms = super::duration_to_millis(attempt_started_at.elapsed());
+                super::metrics::record_gateway_upstream_attempt(duration_ms, true);
+                return Err(first_err.to_string());
+            }
             Err(first_err) => {
                 let fresh =
                     match super::fresh_async_upstream_client_for_account(account.id.as_str()) {
@@ -344,7 +349,10 @@ async fn send_openai_request(
     body: &Bytes,
     is_stream: bool,
     capture: Option<super::OutboundPayloadContext<'_>>,
-) -> Result<GatewayUpstreamResponse, String> {
+) -> Result<
+    GatewayUpstreamResponse,
+    super::upstream::attempt_flow::transport::AsyncStreamRequestError,
+> {
     super::upstream::send_stream_request_with_capture(
         client,
         method,
@@ -359,7 +367,6 @@ async fn send_openai_request(
     )
     .await
     .map(GatewayUpstreamResponse::Stream)
-    .map_err(|err| err.to_string())
 }
 
 #[cfg(test)]

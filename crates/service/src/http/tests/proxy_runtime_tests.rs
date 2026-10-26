@@ -28,6 +28,9 @@ use tokio_tungstenite::tungstenite::handshake::server::{Callback, Request, Respo
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
+#[path = "responses_websocket_interrupt_tests.rs"]
+mod responses_websocket_interrupt_tests;
+
 struct EnvGuard {
     key: &'static str,
     original: Option<std::ffi::OsString>,

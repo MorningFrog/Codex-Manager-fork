@@ -1,3 +1,4 @@
+use crate::http::gateway_replay_guard::{UpstreamReplayGuard, AMBIGUOUS_UPSTREAM_DELIVERY_MESSAGE};
 use crate::http::gateway_request::GatewayRequest as Request;
 use bytes::Bytes;
 use codexmanager_core::storage::Account;
@@ -146,6 +147,7 @@ pub(in super::super) struct UpstreamRequestContext<'a> {
     pub(in super::super) protocol_type: &'a str,
     pub(in super::super) is_fedramp: bool,
     pub(in super::super) capture: Option<super::super::super::OutboundPayloadContext<'a>>,
+    pub(in super::super) replay_guard: Option<&'a UpstreamReplayGuard>,
 }
 
 impl<'a> UpstreamRequestContext<'a> {
@@ -166,6 +168,7 @@ impl<'a> UpstreamRequestContext<'a> {
             protocol_type,
             is_fedramp: false,
             capture: None,
+            replay_guard: Some(request.upstream_replay_guard()),
         }
     }
 
@@ -180,6 +183,17 @@ impl<'a> UpstreamRequestContext<'a> {
     pub(in super::super) fn with_fedramp(mut self, is_fedramp: bool) -> Self {
         self.is_fedramp = is_fedramp;
         self
+    }
+
+    pub(in super::super) fn replay_is_blocked(self) -> bool {
+        self.replay_guard
+            .is_some_and(UpstreamReplayGuard::is_blocked)
+    }
+
+    fn block_replay(self) {
+        if let Some(guard) = self.replay_guard {
+            guard.block_after_ambiguous_delivery();
+        }
     }
 }
 
@@ -655,6 +669,42 @@ pub(in crate::gateway) enum AsyncStreamRequestError {
     ResponseHeadersTimeout(Duration),
     WorkerLimit,
     WorkerUnavailable(String),
+    ResponseMetadataUnavailable,
+    ReplayBlocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportReplaySafety {
+    ConnectRetry,
+    NotSent,
+    Ambiguous,
+}
+
+impl AsyncStreamRequestError {
+    fn replay_safety(&self) -> TransportReplaySafety {
+        match self {
+            Self::Request(err) if err.is_connect() => TransportReplaySafety::ConnectRetry,
+            Self::Request(err) if err.is_builder() => TransportReplaySafety::NotSent,
+            Self::Request(_)
+            | Self::ResponseHeadersTimeout(_)
+            | Self::ResponseMetadataUnavailable
+            | Self::ReplayBlocked => TransportReplaySafety::Ambiguous,
+            Self::WorkerLimit | Self::WorkerUnavailable(_) => TransportReplaySafety::NotSent,
+        }
+    }
+
+    pub(in crate::gateway) fn can_retry_connect(&self) -> bool {
+        self.replay_safety() == TransportReplaySafety::ConnectRetry
+    }
+
+    fn error_for_request(&self, request_ctx: UpstreamRequestContext<'_>) -> String {
+        if self.replay_safety() == TransportReplaySafety::Ambiguous {
+            request_ctx.block_replay();
+            format!("{AMBIGUOUS_UPSTREAM_DELIVERY_MESSAGE}: {self}")
+        } else {
+            self.to_string()
+        }
+    }
 }
 
 impl std::fmt::Display for AsyncStreamRequestError {
@@ -673,6 +723,13 @@ impl std::fmt::Display for AsyncStreamRequestError {
             Self::WorkerUnavailable(error) => {
                 write!(formatter, "async upstream worker unavailable: {error}")
             }
+            Self::ResponseMetadataUnavailable => {
+                write!(
+                    formatter,
+                    "upstream response metadata channel closed before response headers"
+                )
+            }
+            Self::ReplayBlocked => formatter.write_str(AMBIGUOUS_UPSTREAM_DELIVERY_MESSAGE),
         }
     }
 }
@@ -681,9 +738,11 @@ impl std::error::Error for AsyncStreamRequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Request(err) => Some(err),
-            Self::ResponseHeadersTimeout(_) | Self::WorkerLimit | Self::WorkerUnavailable(_) => {
-                None
-            }
+            Self::ResponseHeadersTimeout(_)
+            | Self::WorkerLimit
+            | Self::WorkerUnavailable(_)
+            | Self::ResponseMetadataUnavailable
+            | Self::ReplayBlocked => None,
         }
     }
 }
@@ -766,6 +825,15 @@ pub(in crate::gateway) async fn send_stream_request_with_capture(
     capture: Option<super::super::super::OutboundPayloadContext<'_>>,
     logical_body: Option<&Bytes>,
 ) -> Result<super::super::GatewayStreamResponse, AsyncStreamRequestError> {
+    // Capture before spawning: runtime workers do not inherit task-local state.
+    // The caller retains this handle while awaiting metadata, across all routes.
+    let replay_guard = crate::http::gateway_replay_guard::current_upstream_replay_guard();
+    if replay_guard
+        .as_ref()
+        .is_some_and(UpstreamReplayGuard::is_blocked)
+    {
+        return Err(AsyncStreamRequestError::ReplayBlocked);
+    }
     let logical_body = logical_body.cloned();
     let capture = capture.map(|scope| (scope.trace_id.to_string(), scope.key_id.to_string()));
     let client = client.clone();
@@ -859,15 +927,22 @@ pub(in crate::gateway) async fn send_stream_request_with_capture(
         .map_err(|()| {
             AsyncStreamRequestError::WorkerUnavailable("downstream request cancelled".to_owned())
         })?;
-    match metadata {
+    let result = match metadata {
         Ok(Ok((status, headers))) => Ok(super::super::GatewayStreamResponse::new(
             status, headers, body,
         )),
         Ok(Err(err)) => Err(err),
-        Err(_) => Err(AsyncStreamRequestError::WorkerUnavailable(
-            "response metadata channel closed".to_owned(),
-        )),
+        Err(_) => Err(AsyncStreamRequestError::ResponseMetadataUnavailable),
+    };
+    if result
+        .as_ref()
+        .is_err_and(|err| err.replay_safety() == TransportReplaySafety::Ambiguous)
+    {
+        if let Some(guard) = replay_guard {
+            guard.block_after_ambiguous_delivery();
+        }
     }
+    result
 }
 
 /// 函数 `encode_request_body`
@@ -1069,6 +1144,9 @@ async fn send_upstream_request_with_compression_override(
     drop_session_headers: bool,
     compression_override: Option<RequestCompression>,
 ) -> Result<GatewayUpstreamResponse, String> {
+    if request_ctx.replay_is_blocked() {
+        return Err(AMBIGUOUS_UPSTREAM_DELIVERY_MESSAGE.to_owned());
+    }
     let attempt_started_at = Instant::now();
     let is_compact_request = is_compact_request_path(request_ctx.request_path);
     let chatgpt_account_header = resolve_chatgpt_account_header(account, target_url);
@@ -1324,7 +1402,12 @@ async fn send_upstream_request_with_compression_override(
         .await
         {
             Ok(resp) => Ok(GatewayUpstreamResponse::Stream(resp)),
+            Err(first_err) if !first_err.can_retry_connect() => {
+                Err(first_err.error_for_request(request_ctx))
+            }
             Err(first_err) => {
+                // A failed connect never submitted the body. Only that failure
+                // may recover with another client or compression setting.
                 let fresh_async = match super::super::super::fresh_async_upstream_client_for_account(
                     account.id.as_str(),
                 ) {
@@ -1376,7 +1459,7 @@ async fn send_upstream_request_with_compression_override(
                                 first_err,
                                 second_err
                             );
-                            Err(second_err.to_string())
+                            Err(second_err.error_for_request(request_ctx))
                         }
                     }
                 } else {
@@ -1412,7 +1495,7 @@ async fn send_upstream_request_with_compression_override(
                                 first_err,
                                 second_err
                             );
-                            Err(second_err.to_string())
+                            Err(second_err.error_for_request(request_ctx))
                         }
                     }
                 }
@@ -1840,3 +1923,7 @@ async fn send_websocket_upstream_request_with_capture(
 #[cfg(test)]
 #[path = "transport_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "transport_replay_tests.rs"]
+mod transport_replay_tests;

@@ -6,6 +6,7 @@ fn request_ctx(path: &'static str, protocol_type: &'static str) -> UpstreamReque
         protocol_type,
         is_fedramp: false,
         capture: None,
+        replay_guard: None,
     }
 }
 

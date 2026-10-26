@@ -1,6 +1,9 @@
 use super::*;
 use codexmanager_core::storage::AggregateApi;
 
+#[path = "hybrid_no_header_replay.rs"]
+mod hybrid_no_header_replay;
+
 const MODEL: &str = "gpt-hybrid-route-test";
 const UPSTREAM_MODEL: &str = "gpt-hybrid-route-upstream";
 

@@ -672,7 +672,7 @@ fn try_read_http_request_once(stream: &mut TcpStream) -> Option<CapturedUpstream
 ///
 /// # 返回
 /// 返回函数执行结果
-fn accept_http_request(
+pub(super) fn accept_http_request(
     listener: &TcpListener,
     idle_timeout: Duration,
 ) -> Option<(TcpStream, CapturedUpstreamRequest)> {
