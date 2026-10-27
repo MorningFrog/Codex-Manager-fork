@@ -56,7 +56,7 @@ export const EN_AGGREGATE_API_MESSAGES: MessageCatalog = {
   "暂无聚合 API，点击右上角新建":
     "No aggregate APIs yet. Create one from the top-right corner.",
   "没有匹配当前筛选的聚合 API": "No aggregate APIs match the current filters.",
-  "测试 route": "Test route",
+  测试路由: "Test route",
   "删除连接时会同时删除引用它的模型路由。":
     "Deleting a connection also deletes model routes that reference it.",
   "配置一个最小转发上游，保存 URL 和密钥后即可用于平台密钥轮转。":

@@ -56,7 +56,7 @@ export const KO_AGGREGATE_API_MESSAGES: MessageCatalog = {
   "暂无聚合 API，点击右上角新建":
     "Aggregate API가 없습니다. 오른쪽 위에서 새로 만드세요.",
   "没有匹配当前筛选的聚合 API": "현재 필터와 일치하는 Aggregate API가 없습니다.",
-  "测试 route": "route 테스트",
+  测试路由: "라우트 테스트",
   "删除连接时会同时删除引用它的模型路由。":
     "연결을 삭제하면 이를 참조하는 모델 라우트도 함께 삭제됩니다.",
   "配置一个最小转发上游，保存 URL 和密钥后即可用于平台密钥轮转。":

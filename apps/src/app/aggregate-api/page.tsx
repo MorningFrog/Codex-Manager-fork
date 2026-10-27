@@ -124,6 +124,18 @@ function secretPreview(secret: AggregateApiSecretResult): string {
 
 export default function AggregateApiPage() {
   const { t } = useI18n();
+  const statusFilterItems = [
+    { value: "all", label: t("全部状态") },
+    { value: "active", label: t("已启用") },
+    { value: "disabled", label: t("已禁用") },
+  ];
+  const providerFilterItems = [
+    { value: "all", label: t("全部类型") },
+    { value: "codex", label: "Codex" },
+    { value: "claude", label: "Claude" },
+    { value: "gemini", label: "Gemini" },
+    { value: "compatible", label: t("通用兼容（Codex + Claude）") },
+  ];
   const queryClient = useQueryClient();
   const serviceStatus = useAppStore((state) => state.serviceStatus);
   const serviceAddr = normalizeQueryServiceAddress(serviceStatus.addr);
@@ -418,6 +430,7 @@ export default function AggregateApiPage() {
               </div>
               <div className="flex flex-wrap items-center justify-end gap-2">
                 <Select
+                  items={statusFilterItems}
                   value={statusFilter}
                   onValueChange={(value) => setStatusFilter(value || "all")}
                 >
@@ -433,6 +446,7 @@ export default function AggregateApiPage() {
                   </SelectContent>
                 </Select>
                 <Select
+                  items={providerFilterItems}
                   value={providerFilter}
                   onValueChange={(value) => setProviderFilter(value || "all")}
                 >
@@ -533,7 +547,7 @@ export default function AggregateApiPage() {
                                 {api.modelSlugs.length > 3 ? <Badge variant="secondary">+{api.modelSlugs.length - 3}</Badge> : null}
                               </div>
                             ) : (
-                              <Badge variant="destructive">missing route</Badge>
+                              <Badge variant="destructive">{t("路由缺失")}</Badge>
                             )}
                           </TableCell>
                           <TableCell>
@@ -566,7 +580,7 @@ export default function AggregateApiPage() {
                                 </Badge>
                               )}
                               <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs" disabled={testingApiId === api.id || api.modelSlugs.length === 0} onClick={() => testMutation.mutate(api.id)}>
-                                {testingApiId === api.id ? t("测试中...") : t("测试 route")}
+                                {testingApiId === api.id ? t("测试中...") : t("测试路由")}
                               </Button>
                             </div>
                           </TableCell>

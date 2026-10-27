@@ -1,6 +1,6 @@
 {
   "name": "codexmanager-frontend",
-  "version": "0.6.8",
+  "version": "0.6.9",
   "packageManager": "pnpm@10.30.3",
   "private": true,
   "scripts": {

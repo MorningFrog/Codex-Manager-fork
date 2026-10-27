@@ -5,6 +5,23 @@ It follows Keep a Changelog with a lightweight adaptation for this repository.
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-10-27
+
+### Added
+
+- Added an Order column with drag handles, up/down buttons, and keyboard ordering for models and routes. Model order saves automatically; searches and filters preserve hidden and nonmatching slots, and display ordering does not change model ranks or ceilings (#514).
+
+### Changed
+
+- Adjusted sidebar height and spacing for a more usable navigation layout (#513).
+
+### Fixed
+
+- Fixed aggregated API filters displaying internal values such as `all` and `codex`. Selected labels now follow the interface language, including the missing-model-route message.
+- Fixed forwarding Responses WebSocket interrupt controls, retaining completed interrupted context and usage for subsequent requests in the same session without automatically replaying interrupted requests (#511).
+- Stopped retries, account failover, and fallback routes within a request after a connection loss or response-header timeout leaves upstream delivery uncertain. Known pre-connection failures and explicit rejection responses retain their recovery flows (#510).
+- Added Linux AppImage update information and matching `.zsync` files generated from final packages so AppImageUpdate can detect updates (#512).
+
 ## [0.6.8] - 2026-10-18
 
 ### Fixed
