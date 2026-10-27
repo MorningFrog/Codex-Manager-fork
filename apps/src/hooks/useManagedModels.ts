@@ -173,13 +173,38 @@ export function useManagedModels() {
   const saveMutation = useMutation({
     mutationFn: (input: ManagedModelV2Upsert) =>
       managedModelsV2Client.upsert(input, serviceAddr),
-    onSuccess: async () => {
-      await reloadCatalog();
-      await invalidateConsumers();
+    onSuccess: (savedModel, input) => {
+      queryClient.setQueryData<ManagedModelListV2Result>(managedModelsQueryKey, (current) => {
+        if (!current) return current;
+        const previousSlug = input.previousSlug || savedModel.slug;
+        const exists = current.items.some((model) => model.slug === previousSlug);
+        const items = exists
+          ? current.items.map((model) => model.slug === previousSlug ? savedModel : model)
+          : [...current.items, savedModel];
+        return { items, stats: buildCatalogStats(items) };
+      });
       toast.success(t("模型已保存"));
+      void refreshCatalogAfterCommittedMutation();
     },
     onError: (error: unknown) => {
       toast.error(`${t("保存模型失败")}: ${getAppErrorMessage(error)}`);
+    },
+  });
+
+  const reorderMutation = useMutation({
+    mutationFn: (input: { slugs: string[]; expectedSlugs: string[] }) =>
+      managedModelsV2Client.reorder(input, serviceAddr),
+    onSuccess: (items) => {
+      queryClient.setQueryData<ManagedModelListV2Result>(
+        managedModelsQueryKey,
+        { items, stats: buildCatalogStats(items) },
+      );
+      toast.success(t("模型顺序已保存"));
+      void refreshCatalogAfterCommittedMutation();
+    },
+    onError: (error: unknown) => {
+      toast.error(`${t("保存模型顺序失败")}: ${getAppErrorMessage(error)}`);
+      void refreshCatalogAfterCommittedMutation();
     },
   });
 
@@ -612,6 +637,16 @@ export function useManagedModels() {
       return commitImportMutation.mutateAsync(input);
     },
     isRefreshing: query.isRefetching,
+    reorderModels: async (input: { slugs: string[]; expectedSlugs: string[] }) => {
+      if (!ensureServiceReady("排序模型")) return false;
+      try {
+        await reorderMutation.mutateAsync(input);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    isReordering: reorderMutation.isPending,
     isApplyingModels: applyModelsMutation.isPending,
     isSyncingPrices: priceSyncMutation.isPending,
     isSaving: saveMutation.isPending,

@@ -194,6 +194,7 @@ macro_rules! invoke_handler {
             crate::commands::apikey::service_managed_model_list_v2,
             crate::commands::apikey::service_managed_model_get_v2,
             crate::commands::apikey::service_managed_model_upsert_v2,
+            crate::commands::apikey::service_managed_model_reorder_v2,
             crate::commands::apikey::service_managed_model_update_state_v2,
             crate::commands::apikey::service_managed_model_batch_update_state_v2,
             crate::commands::apikey::service_managed_model_delete_v2,

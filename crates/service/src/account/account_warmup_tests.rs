@@ -5,8 +5,8 @@ use super::{
     DEFAULT_WARMUP_MODEL,
 };
 use codexmanager_core::storage::{
-    now_ts, Account, ManagedModelV2, ManagedModelV2Upsert, ModelPriceV2, Storage, Token,
-    UsageSnapshotRecord,
+    now_ts, Account, ManagedModelReorderV2Params, ManagedModelV2, ManagedModelV2Upsert,
+    ModelPriceV2, Storage, Token, UsageSnapshotRecord,
 };
 use std::io::Cursor;
 
@@ -190,8 +190,24 @@ fn disable_seed_models(storage: &Storage) {
     }
 }
 
+fn reverse_model_display_order(storage: &Storage) {
+    let expected_slugs = storage
+        .list_managed_models_v2(true)
+        .expect("list complete model catalog")
+        .into_iter()
+        .map(|model| model.slug)
+        .collect::<Vec<_>>();
+    let slugs = expected_slugs.iter().rev().cloned().collect();
+    storage
+        .reorder_managed_models_v2(&ManagedModelReorderV2Params {
+            slugs,
+            expected_slugs,
+        })
+        .expect("reverse display order");
+}
+
 #[test]
-fn resolve_warmup_model_slug_uses_first_supported_model_from_catalog_order() {
+fn resolve_warmup_model_slug_keeps_legacy_rank_after_display_reorder() {
     let (storage, account) = reset_warmup_fixture();
     let target = resolve_reset_warmup_target(&storage, &account.id).expect("resolve target");
     disable_seed_models(&storage);
@@ -207,6 +223,7 @@ fn resolve_warmup_model_slug_uses_first_supported_model_from_catalog_order() {
         image,
         make_model("gpt-unsupported", 1, false),
         make_model("gpt-latest", 1, true),
+        make_model("Z-latest", 1, true),
         make_model("gpt-older", 2, true),
     ] {
         storage
@@ -214,6 +231,13 @@ fn resolve_warmup_model_slug_uses_first_supported_model_from_catalog_order() {
             .expect("save model catalog V2 item");
     }
 
+    assert_eq!(
+        resolve_warmup_model_slug_with_ceiling(&storage, &target, "auto").unwrap(),
+        "gpt-latest"
+    );
+
+    reverse_model_display_order(&storage);
+    assert_eq!(storage.list_api_models_v2().unwrap()[0].slug, "gpt-older");
     assert_eq!(
         resolve_warmup_model_slug_with_ceiling(&storage, &target, "auto").unwrap(),
         "gpt-latest"
@@ -232,7 +256,7 @@ fn resolve_warmup_model_slug_falls_back_when_catalog_missing() {
 }
 
 #[test]
-fn resolve_warmup_model_slug_honors_free_account_model_ceiling() {
+fn resolve_warmup_model_slug_honors_free_account_model_ceiling_after_display_reorder() {
     let (storage, account) = reset_warmup_fixture();
     storage
         .insert_usage_snapshot(&UsageSnapshotRecord {
@@ -259,6 +283,8 @@ fn resolve_warmup_model_slug_honors_free_account_model_ceiling() {
             .expect("save model catalog V2 item");
     }
 
+    reverse_model_display_order(&storage);
+    assert_eq!(storage.list_api_models_v2().unwrap()[0].slug, "gpt-older");
     assert_eq!(
         resolve_warmup_model_slug_with_ceiling(&storage, &target, "gpt-free-boundary").unwrap(),
         "gpt-free-boundary"

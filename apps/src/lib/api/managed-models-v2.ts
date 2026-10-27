@@ -53,6 +53,19 @@ export const managedModelsV2Client = {
     );
   },
 
+  reorder(
+    input: { slugs: string[]; expectedSlugs: string[] },
+    addr?: string | null,
+  ): Promise<ManagedModelV2[]> {
+    return invoke<ManagedModelV2[]>(
+      "service_managed_model_reorder_v2",
+      withAddr({
+        payload: input,
+        ...(addr === undefined ? {} : { addr: addr || null }),
+      }),
+    );
+  },
+
   updateState(
     input: ManagedModelStateV2Update,
     addr?: string | null,

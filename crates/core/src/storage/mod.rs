@@ -26,6 +26,7 @@ mod events;
 mod key_id_filters;
 mod model_billing_v2;
 mod model_catalog_v2;
+mod model_display_order;
 mod model_groups;
 mod model_options;
 mod model_price_rules;
@@ -64,6 +65,7 @@ pub use model_catalog_v2::{
     ManagedModelStateV2Update, ManagedModelV2, ManagedModelV2Upsert, ModelCatalogV2Stats,
     ModelFastPolicyV2, ModelPriceV2, ModelRouteV2,
 };
+pub use model_display_order::{validate_managed_model_reorder_v2, ManagedModelReorderV2Params};
 pub use proxy_profiles::derive_proxy_profile_url_metadata;
 pub use request_log_payload_batch::{is_sqlite_busy_error, RequestLogPayloadBatch};
 pub use request_log_payload_store::{
@@ -2393,6 +2395,10 @@ impl Storage {
                 }
                 Ok(())
             },
+        )?;
+        self.apply_sql_migration(
+            "144_model_display_order",
+            include_str!("../../migrations/144_model_display_order.sql"),
         )?;
         self.ensure_api_key_rotation_columns()?;
         self.ensure_api_key_account_group_filter_column()?;

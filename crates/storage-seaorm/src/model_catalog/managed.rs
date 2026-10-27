@@ -124,9 +124,16 @@ impl ManagedModelsRepository {
         if !include_hidden {
             query = query.filter(models::Column::Visibility.eq("list"));
         }
+        let mut records = query
+            .all(db)
+            .await?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<CatalogModelRecord>, DbErr>>()?;
+        super::display_order::sort_records(db, &mut records).await?;
         let mut result = Vec::new();
-        for record in query.all(db).await? {
-            result.push(Self::assemble(db, record.try_into()?).await?);
+        for record in records {
+            result.push(Self::assemble(db, record).await?);
         }
         Ok(result)
     }

@@ -47,6 +47,7 @@ pub(crate) async fn migrate(db: &DatabaseConnection) -> Result<(), DbErr> {
         schema.create_table_from_entity(crate::reset_credit_operations::Entity),
         schema.create_table_from_entity(crate::reset_credit_operations::pending_accounts::Entity),
         schema.create_table_from_entity(crate::model_catalog::models::Entity),
+        schema.create_table_from_entity(crate::model_catalog::display_order::Entity),
         schema.create_table_from_entity(crate::model_catalog::prices::Entity),
         schema.create_table_from_entity(crate::model_catalog::price_tiers::Entity),
         schema.create_table_from_entity(crate::model_catalog::routes::Entity),

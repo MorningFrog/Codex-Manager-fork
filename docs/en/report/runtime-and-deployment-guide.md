@@ -68,6 +68,14 @@ The account's five-hour quota comes from the official usage endpoint, not a conv
 
 To avoid duplicate submissions, if a connection closes or response headers time out while establishing the upstream HTTP response and delivery is uncertain, CM stops automatic retries, account failover, and fallback routes within that request, and reports that the upstream may already have processed it. Failures known to occur before connection establishment remain recoverable, as do existing recovery flows for explicit rejection responses. A subsequent client retry is a new request and may resend the full context; this protection does not guarantee that failed requests consume no official quota.
 
+### Model and route ordering
+
+Administrators can drag the handle in the **Order** column, click the up/down buttons, or focus a handle and use the arrow keys. Model ordering saves automatically. Searches and filters reorder only the visible slots, retaining hidden and nonmatching models in place. Stale submissions from concurrent windows or catalog additions/deletions are rejected and the catalog is reloaded.
+
+Display ordering is stored separately from model ceilings, pricing, enabled state, and routes. The editor's **Model rank (advanced)** field retains its existing meaning for model ceilings and is separate from display order. Service model lists and the CodexManager local catalog use the saved display order; official catalogs retain their own order. Use **Apply models** again to update a selected local catalog already applied to Codex.
+
+The model editor's **Routes** tab also supports handles and arrows. An explicit move renumbers the entire route list with higher priority for earlier routes, committed by **Save model**. Without a move, existing priorities and equal-priority weights remain intact. Closing without saving does not submit route changes.
+
 ## Import and export
 - `Batch import`: select multiple `.json/.txt` files and import them together.
 - `Import by folder`: desktop only. After selecting a directory, the app recursively scans `.json` files and imports them in batches. Empty files are skipped automatically.

@@ -3,6 +3,19 @@
 import type { MessageCatalog } from "../types";
 
 export const EN_MODELS_MESSAGES: MessageCatalog = {
+  顺序: "Order",
+  "模型等级（高级）": "Model rank (advanced)",
+  "数值越小等级越高，影响模型上限；显示顺序请在列表中调整。": "Lower values mean higher model rank and affect model ceilings. Change display order in the list.",
+  "移动模型 {slug}": "Move model {slug}",
+  "移动路由 {index}": "Move route {index}",
+  "拖动排序，或使用方向键上下移动": "Drag to reorder, or use the up and down arrow keys",
+  "上移：{label}": "Move up: {label}",
+  "下移：{label}": "Move down: {label}",
+  "拖动顺序列或点击箭头调整模型顺序，自动保存；筛选时只调整当前显示的模型。": "Drag the order handle or use the arrows to reorder models. Changes save automatically; filtering only reorders visible models.",
+  "调整顺序会重新编号全部路由的优先级，靠前的更高；未调整时保留原有优先级。权重保持不变，保存后生效。": "Reordering renumbers all route priorities, with earlier routes preferred. Without reordering, existing priorities remain intact. Weights are unchanged; save to apply.",
+  模型顺序已保存: "Model order saved",
+  保存模型顺序失败: "Failed to save model order",
+  排序模型: "reorder models",
   模型与路由: "Models and routing",
   "配置 CodexManager 本地网关目录中的模型、价格、路由和指令策略。":
     "Configure models, prices, routes, and instruction policies in the local CodexManager gateway catalog.",

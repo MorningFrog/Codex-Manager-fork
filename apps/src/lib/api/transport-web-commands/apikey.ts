@@ -32,6 +32,7 @@ export function createApiKeyWebCommands(): Record<string, WebCommandDescriptor> 
     service_managed_model_list_v2: { rpcMethod: "apikey/managedModelListV2" },
     service_managed_model_get_v2: { rpcMethod: "apikey/managedModelGetV2" },
     service_managed_model_upsert_v2: { rpcMethod: "apikey/managedModelUpsertV2", mapParams: (params) => asRecord(asRecord(params)?.payload) ?? {} },
+    service_managed_model_reorder_v2: { rpcMethod: "apikey/managedModelReorderV2", mapParams: (params) => asRecord(asRecord(params)?.payload) ?? {} },
     service_managed_model_update_state_v2: { rpcMethod: "apikey/managedModelUpdateStateV2", mapParams: (params) => asRecord(asRecord(params)?.payload) ?? {} },
     service_managed_model_batch_update_state_v2: { rpcMethod: "apikey/managedModelBatchUpdateStateV2", mapParams: (params) => asRecord(asRecord(params)?.payload) ?? {} },
     service_managed_model_delete_v2: { rpcMethod: "apikey/managedModelDeleteV2" },

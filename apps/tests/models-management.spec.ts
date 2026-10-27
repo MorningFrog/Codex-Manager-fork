@@ -76,7 +76,13 @@ type Rect = {
 
 type MockState = {
   models: JsonObject[];
+  modelOrder: string[] | null;
+  sessionRole: "system_admin" | "member";
+  orderCalls: JsonObject[];
+  orderError: string | null;
+  orderDelayMs: number;
   upserts: JsonObject[];
+  upsertError: string | null;
   stateUpdates: JsonObject[];
   stateUpdateError: string | null;
   batchStateUpdates: JsonObject[];
@@ -366,9 +372,16 @@ function freshModels(): JsonObject[] {
   ];
 }
 
-function catalogResult(models: JsonObject[]) {
+function catalogResult(models: JsonObject[], displayOrder: string[] | null = null) {
+  const positions = new Map(displayOrder?.map((slug, index) => [slug, index]));
   return {
-    items: models,
+    items: [...models].sort(
+      (left, right) =>
+        (positions.get(String(left.slug)) ?? Number.MAX_SAFE_INTEGER) -
+          (positions.get(String(right.slug)) ?? Number.MAX_SAFE_INTEGER) ||
+        Number(left.sortOrder) - Number(right.sortOrder) ||
+        String(left.slug).localeCompare(String(right.slug), "en"),
+    ),
     stats: {
       total: models.length,
       enabled: models.filter((model) => model.enabled === true).length,
@@ -383,6 +396,38 @@ function catalogResult(models: JsonObject[]) {
           !model.routes.some((route) => (route as JsonObject).enabled === true),
       ).length,
     },
+  };
+}
+
+function orderModels(): JsonObject[] {
+  return [
+    builtinModel("sort-a", 10),
+    builtinModel("sort-hidden", 20, "hide"),
+    builtinModel("sort-b", 30),
+    { ...builtinModel("other-model", 40), enabled: false },
+    builtinModel("sort-c", 50),
+  ];
+}
+
+async function visibleModelSlugs(page: Page): Promise<string[]> {
+  return page.locator("[data-model-slug]").evaluateAll((rows) =>
+    rows.map((row) => row.getAttribute("data-model-slug") || ""),
+  );
+}
+
+async function dragModel(page: Page, source: string, target: string) {
+  await page.getByRole("button", { name: `移动模型 ${source}`, exact: true })
+    .dragTo(page.locator(`[data-model-slug="${target}"]`));
+}
+
+function routeOrderModel(): JsonObject {
+  return {
+    ...builtinModel("gpt-6-sol", 2),
+    routes: [
+      { id: "route-first", sourceKind: "account_pool", sourceId: "default", upstreamModel: "first-upstream", enabled: true, priority: 30, weight: 2 },
+      { id: "route-second", sourceKind: "aggregate_api", sourceId: "agg-1", upstreamModel: "second-upstream", enabled: false, priority: 20, weight: 7 },
+      { id: "route-third", sourceKind: "aggregate_api", sourceId: LONG_AGGREGATE_ID, upstreamModel: "third-upstream", enabled: true, priority: 20, weight: 5 },
+    ],
   };
 }
 
@@ -409,7 +454,13 @@ function importedModel(): JsonObject {
 async function installMockRuntime(page: Page): Promise<MockState> {
   const state: MockState = {
     models: freshModels(),
+    modelOrder: null,
+    sessionRole: "system_admin",
+    orderCalls: [],
+    orderError: null,
+    orderDelayMs: 0,
     upserts: [],
+    upsertError: null,
     stateUpdates: [],
     stateUpdateError: null,
     batchStateUpdates: [],
@@ -471,9 +522,9 @@ async function installMockRuntime(page: Page): Promise<MockState> {
     if (method === "accountManager/session/current") {
       await ok({
         mode: "server",
-        role: "system_admin",
+        role: state.sessionRole,
         currentUser: null,
-        permissions: ["*"],
+        permissions: state.sessionRole === "system_admin" ? ["*"] : [],
         distributionEnabled: true,
       });
       return;
@@ -645,7 +696,47 @@ async function installMockRuntime(page: Page): Promise<MockState> {
         });
         return;
       }
-      await ok(catalogResult(state.models));
+      await ok(catalogResult(state.models, state.modelOrder));
+      return;
+    }
+    if (method === "apikey/managedModelReorderV2") {
+      state.orderCalls.push(structuredClone(params));
+      if (state.orderDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, state.orderDelayMs));
+      }
+      const slugs = Array.isArray(params.slugs)
+        ? params.slugs.map(String)
+        : [];
+      const expectedSlugs = Array.isArray(params.expectedSlugs)
+        ? params.expectedSlugs.map(String)
+        : [];
+      const currentSlugs = catalogResult(state.models, state.modelOrder).items.map(
+        (model) => String(model.slug),
+      );
+      const error =
+        state.orderError ||
+        (state.sessionRole !== "system_admin" ? "permission_denied" : null) ||
+        (JSON.stringify(expectedSlugs) !== JSON.stringify(currentSlugs)
+          ? "model_order_conflict"
+          : null) ||
+        (slugs.length !== currentSlugs.length ||
+        new Set(slugs).size !== currentSlugs.length ||
+        slugs.some((slug) => !currentSlugs.includes(slug))
+          ? "invalid_model_order"
+          : null);
+      if (error) {
+        await route.fulfill({
+          contentType: "application/json; charset=utf-8",
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32000, message: error },
+          }),
+        });
+        return;
+      }
+      state.modelOrder = slugs;
+      await ok(catalogResult(state.models, state.modelOrder).items);
       return;
     }
     if (method === "apikey/managedModelGetV2") {
@@ -655,6 +746,17 @@ async function installMockRuntime(page: Page): Promise<MockState> {
     }
     if (method === "apikey/managedModelUpsertV2") {
       state.upserts.push(structuredClone(params));
+      if (state.upsertError) {
+        await route.fulfill({
+          contentType: "application/json; charset=utf-8",
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32000, message: state.upsertError },
+          }),
+        });
+        return;
+      }
       const inputModel = structuredClone((params.model ?? {}) as JsonObject);
       const slug = String(inputModel.slug ?? "");
       const previousSlug = String(params.previousSlug ?? "");
@@ -985,7 +1087,7 @@ test("应用模型只写入勾选项，支持图片模型且不会重载 Codex �
   expect(state.applyModelCalls[2]).toEqual({
     addr: "localhost:48760",
     codexHome: "/tmp/.codex",
-    modelSlugs: state.models.map((model) => model.slug),
+    modelSlugs: catalogResult(state.models, state.modelOrder).items.map((model) => model.slug),
     reloadAfterSwitch: false,
   });
 });
@@ -1510,7 +1612,7 @@ test("编辑器不依赖后续动画帧即可载入目标模型", async ({ page 
     "placeholder",
     "例如：编程, 推理",
   );
-  await expect(page.getByLabel("排序")).toHaveValue("2");
+  await expect(page.getByLabel("模型等级（高级）")).toHaveValue("2");
   await expect(page.getByLabel("上下文窗口", { exact: true })).toHaveValue(
     "272000",
   );
@@ -1803,6 +1905,231 @@ test("模型目录支持中文展示并为多个模型批量分配路由", async
       ]),
     );
   }
+});
+
+test("模型排序拖动持久化完整目录且不改变模型权限等级", async ({ page }) => {
+  const state = await installMockRuntime(page);
+  state.models = orderModels();
+  const originalModels = structuredClone(state.models);
+  const before = ["sort-a", "sort-hidden", "sort-b", "other-model", "sort-c"];
+  const after = ["sort-c", "sort-hidden", "sort-a", "sort-b", "other-model"];
+  await page.goto("/models/");
+  await expect(page.locator("[data-model-slug]")).toHaveCount(4);
+  await expect(page.getByRole("columnheader", { name: "顺序", exact: true })).toBeVisible();
+
+  await dragModel(page, "sort-c", "sort-a");
+  await expect.poll(() => state.orderCalls.length).toBe(1);
+  await expect.poll(() => visibleModelSlugs(page)).toEqual([
+    "sort-c", "sort-a", "sort-b", "other-model",
+  ]);
+  expect(state.orderCalls[0]).toEqual({ slugs: after, expectedSlugs: before });
+  expect(state.models).toEqual(originalModels);
+  expect(state.upserts).toHaveLength(0);
+
+  await page.reload();
+  await expect.poll(() => visibleModelSlugs(page)).toEqual([
+    "sort-c", "sort-a", "sort-b", "other-model",
+  ]);
+  expect(state.modelOrder).toEqual(after);
+  expect(state.orderCalls).toHaveLength(1);
+});
+
+for (const filterMode of ["搜索", "状态筛选"] as const) {
+  test(`模型排序在${filterMode}下保留隐藏及未匹配模型的位置`, async ({ page }) => {
+    const state = await installMockRuntime(page);
+    state.models = orderModels();
+    await page.goto("/models/");
+    await expect(page.locator("[data-model-slug]")).toHaveCount(4);
+    if (filterMode === "搜索") {
+      await page.getByPlaceholder("搜索模型", { exact: true }).fill("sort-");
+    } else {
+      await page.getByRole("combobox", { name: "筛选模型" }).click();
+      await page.getByRole("option", { name: "已启用", exact: true }).click();
+    }
+    await expect.poll(() => visibleModelSlugs(page)).toEqual(["sort-a", "sort-b", "sort-c"]);
+    await dragModel(page, "sort-c", "sort-a");
+    await expect.poll(() => visibleModelSlugs(page)).toEqual(["sort-c", "sort-a", "sort-b"]);
+    expect(state.orderCalls).toEqual([{
+      slugs: ["sort-c", "sort-hidden", "sort-a", "other-model", "sort-b"],
+      expectedSlugs: ["sort-a", "sort-hidden", "sort-b", "other-model", "sort-c"],
+    }]);
+
+    if (filterMode === "搜索") {
+      await page.getByPlaceholder("搜索模型", { exact: true }).clear();
+    } else {
+      await page.getByRole("combobox", { name: "筛选模型" }).click();
+      await page.getByRole("option", { name: "全部模型", exact: true }).click();
+    }
+    await expect.poll(() => visibleModelSlugs(page)).toEqual([
+      "sort-c", "sort-a", "other-model", "sort-b",
+    ]);
+    expect(state.models.find((model) => model.slug === "sort-hidden")).toMatchObject({
+      visibility: "hide", sortOrder: 20,
+    });
+  });
+}
+
+test("模型排序键盘请求期间禁用写操作，失败后保留顺序和选择并可重试", async ({ page }) => {
+  const state = await installMockRuntime(page);
+  state.models = orderModels();
+  state.orderError = "order update failed";
+  state.orderDelayMs = 1_500;
+  await page.goto("/models/");
+  await expect(page.locator("[data-model-slug]")).toHaveCount(4);
+  const selected = page.getByRole("checkbox", { name: "选择模型 sort-c", exact: true });
+  await selected.click();
+  const handle = page.getByRole("button", { name: "移动模型 sort-c", exact: true });
+  await handle.focus();
+  await handle.press("ArrowUp");
+  await expect.poll(() => state.orderCalls.length).toBe(1);
+  await expect(handle).toBeDisabled();
+  await expect(selected).toBeDisabled();
+  await expect(page.getByRole("button", { name: "编辑模型 sort-a", exact: true })).toBeDisabled();
+  await expect(page.getByText(/order update failed/)).toBeVisible();
+  await expect.poll(() => visibleModelSlugs(page)).toEqual([
+    "sort-a", "sort-b", "other-model", "sort-c",
+  ]);
+  await expect(selected).toBeChecked();
+  await expect(handle).toBeEnabled();
+  expect(state.modelOrder).toBeNull();
+
+  state.orderError = null;
+  state.orderDelayMs = 0;
+  await handle.press("ArrowUp");
+  await expect.poll(() => state.orderCalls.length).toBe(2);
+  await expect.poll(() => visibleModelSlugs(page)).toEqual([
+    "sort-a", "sort-b", "sort-c", "other-model",
+  ]);
+  expect(state.orderCalls[1]).toEqual(state.orderCalls[0]);
+  expect(state.upserts).toHaveLength(0);
+});
+
+test("模型排序提交成功后重读失败仍保留已提交顺序", async ({ page }) => {
+  const state = await installMockRuntime(page);
+  state.models = orderModels();
+  await page.goto("/models/");
+  await expect(page.locator("[data-model-slug]")).toHaveCount(4);
+  state.listError = "catalog refresh failed";
+  await dragModel(page, "sort-c", "sort-a");
+  await expect.poll(() => state.orderCalls.length).toBe(1);
+  await expect.poll(() => visibleModelSlugs(page)).toEqual([
+    "sort-c", "sort-a", "sort-b", "other-model",
+  ]);
+  await expect(page.getByText(/catalog refresh failed/)).toBeVisible();
+  expect(state.modelOrder).toEqual([
+    "sort-c", "sort-hidden", "sort-a", "sort-b", "other-model",
+  ]);
+  expect(state.upserts).toHaveLength(0);
+});
+
+test("模型排序成员只读且没有拖动或编辑入口", async ({ page }) => {
+  const state = await installMockRuntime(page);
+  state.sessionRole = "member";
+  state.models = orderModels();
+  await page.goto("/models/");
+  await expect(page.locator("[data-model-slug]")).toHaveCount(4);
+  await expect(page.getByRole("button", { name: /^移动模型 / })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^编辑模型 / })).toHaveCount(0);
+  await expect(page.locator("[data-model-slug][draggable=true]")).toHaveCount(0);
+  expect(state.orderCalls).toHaveLength(0);
+  expect(state.upserts).toHaveLength(0);
+});
+
+test("路由排序拖动保存真实优先级并保留来源、权重和启用状态", async ({ page }) => {
+  const state = await installMockRuntime(page);
+  const originalModel = routeOrderModel();
+  state.models = [originalModel];
+  await page.goto("/models/");
+  await page.getByRole("button", { name: "编辑模型 gpt-6-sol", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("tab", { name: "路由", exact: true }).click();
+  const source = dialog.getByRole("button", { name: "移动路由 3", exact: true });
+  await source.hover();
+  const sourceBox = await source.boundingBox();
+  if (!sourceBox) throw new Error("missing route source box");
+  await page.mouse.down();
+  // Start native dragging before Playwright scrolls the offscreen target into
+  // view; dragTo otherwise scrolls the pressed source away before dragstart.
+  await page.mouse.move(sourceBox.x + sourceBox.width / 2 + 8, sourceBox.y + sourceBox.height / 2, { steps: 3 });
+  const target = dialog.locator('[data-route-key="route-first"]');
+  await target.hover({ position: { x: 20, y: 20 } });
+  await target.hover({ position: { x: 20, y: 20 } });
+  await page.mouse.up();
+  await expect(dialog.locator("#route-model-0")).toHaveValue("third-upstream");
+  await dialog.getByRole("button", { name: "保存模型", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(state.upserts).toHaveLength(1);
+  const saved = state.upserts[0].model as JsonObject;
+  const originalRoutes = originalModel.routes as JsonObject[];
+  expect(saved.routes).toEqual([
+    { ...originalRoutes[2], priority: 30 },
+    { ...originalRoutes[0], priority: 20 },
+    { ...originalRoutes[1], priority: 10 },
+  ]);
+  expect(saved.sortOrder).toBe(originalModel.sortOrder);
+  expect(state.orderCalls).toHaveLength(0);
+});
+
+test("路由排序取消不提交且保存失败保留重排草稿", async ({ page }) => {
+  const state = await installMockRuntime(page);
+  state.models = [routeOrderModel()];
+  const originalModels = structuredClone(state.models);
+  await page.goto("/models/");
+  const openRoutes = async () => {
+    await page.getByRole("button", { name: "编辑模型 gpt-6-sol", exact: true }).click();
+    await page.getByRole("dialog").getByRole("tab", { name: "路由", exact: true }).click();
+  };
+  await openRoutes();
+  let dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "移动路由 3", exact: true }).press("ArrowUp");
+  await expect(dialog.locator("#route-model-1")).toHaveValue("third-upstream");
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  expect(state.upserts).toHaveLength(0);
+  expect(state.models).toEqual(originalModels);
+
+  await openRoutes();
+  dialog = page.getByRole("dialog");
+  await expect(dialog.locator("#route-model-1")).toHaveValue("second-upstream");
+  await expect(dialog.locator("#route-priority-1")).toHaveValue("20");
+  await expect(dialog.locator("#route-priority-2")).toHaveValue("20");
+  await dialog.getByRole("button", { name: "移动路由 3", exact: true }).press("ArrowUp");
+  state.upsertError = "route save failed";
+  await dialog.getByRole("button", { name: "保存模型", exact: true }).click();
+  await expect(dialog.getByText("route save failed", { exact: true })).toBeVisible();
+  await expect(dialog.locator("#route-model-1")).toHaveValue("third-upstream");
+  expect(state.models).toEqual(originalModels);
+  expect(state.orderCalls).toHaveLength(0);
+});
+
+test("路由排序提交成功后重读失败仍关闭弹窗并从缓存保留新顺序", async ({ page }) => {
+  const state = await installMockRuntime(page);
+  state.models = [routeOrderModel()];
+  await page.goto("/models/");
+  await page.getByRole("button", { name: "编辑模型 gpt-6-sol", exact: true }).click();
+  let dialog = page.getByRole("dialog");
+  await dialog.getByRole("tab", { name: "路由", exact: true }).click();
+  await dialog.getByRole("button", { name: "移动路由 3", exact: true }).press("ArrowUp");
+  await expect(dialog.locator("#route-model-1")).toHaveValue("third-upstream");
+  state.listError = "catalog refresh after route save failed";
+  await dialog.getByRole("button", { name: "保存模型", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByText("模型已保存", { exact: true })).toBeVisible();
+  await expect(page.getByText(/读取模型失败.*catalog refresh after route save failed/)).toBeVisible();
+  await expect(page.getByText(/^保存模型失败/)).toHaveCount(0);
+  expect(state.upserts).toHaveLength(1);
+  expect(state.listCalls).toBeGreaterThan(1);
+
+  await page.getByRole("button", { name: "编辑模型 gpt-6-sol", exact: true }).click();
+  dialog = page.getByRole("dialog");
+  await dialog.getByRole("tab", { name: "路由", exact: true }).click();
+  await expect(dialog.locator("#route-model-0")).toHaveValue("first-upstream");
+  await expect(dialog.locator("#route-model-1")).toHaveValue("third-upstream");
+  await expect(dialog.locator("#route-model-2")).toHaveValue("second-upstream");
+  await expect(dialog.locator("#route-priority-0")).toHaveValue("30");
+  await expect(dialog.locator("#route-priority-1")).toHaveValue("20");
+  await expect(dialog.locator("#route-priority-2")).toHaveValue("10");
+  expect(state.upserts).toHaveLength(1);
+  expect(state.orderCalls).toHaveLength(0);
 });
 
 test("模型目录 V2 完成本地管理、原子保存和导入", async ({ page }) => {

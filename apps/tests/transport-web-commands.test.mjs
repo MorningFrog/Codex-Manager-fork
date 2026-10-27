@@ -430,6 +430,16 @@ test("createWebCommandMap 为模型目录 V2 原子命令提供 Web RPC 映射",
     { previousSlug: null, model: { slug: "local-x" } },
   );
 
+  const reorder = commandMap.service_managed_model_reorder_v2;
+  assert.equal(reorder.rpcMethod, "apikey/managedModelReorderV2");
+  assert.deepEqual(
+    reorder.mapParams({
+      addr: "localhost:48760",
+      payload: { slugs: ["second", "first"], expectedSlugs: ["first", "second"] },
+    }),
+    { slugs: ["second", "first"], expectedSlugs: ["first", "second"] },
+  );
+
   const updateState = commandMap.service_managed_model_update_state_v2;
   assert.equal(updateState.rpcMethod, "apikey/managedModelUpdateStateV2");
   assert.ok(updateState.mapParams);

@@ -2,6 +2,7 @@ pub(crate) mod fast_policy;
 mod import;
 pub(crate) mod instructions;
 mod official_pricing;
+mod ordering;
 mod pricing_sync;
 mod seaorm;
 
@@ -19,6 +20,7 @@ pub(crate) use import::{
     commit_import, preview_import, ManagedModelImportCommitV2Params,
     ManagedModelImportPreviewV2Params, ManagedModelImportPreviewV2Result,
 };
+pub(crate) use ordering::reorder;
 pub(crate) use pricing_sync::{sync_prices, ManagedModelPriceSyncV2Params};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -698,7 +700,8 @@ pub(crate) fn models_response_with_storage(
         models: api_models(storage)
             .map_err(|err| format!("list API models V2 failed: {err}"))?
             .iter()
-            .map(model_info)
+            .enumerate()
+            .map(|(position, model)| ordered_model_info(position, model))
             .collect(),
         extra: Default::default(),
     })
@@ -712,16 +715,95 @@ pub(crate) fn text_generation_models_response_with_storage(
             .map_err(|err| format!("list API models V2 failed: {err}"))?
             .iter()
             .filter(|model| supports_text_generation(model))
-            .map(model_info)
+            .enumerate()
+            .map(|(position, model)| ordered_model_info(position, model))
             .collect(),
         extra: Default::default(),
     })
+}
+
+pub(crate) fn ordered_model_info(position: usize, model: &ManagedModelV2) -> ModelInfo {
+    let mut info = model_info(model);
+    info.priority = position as i64;
+    info
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use codexmanager_core::storage::Storage;
+
+    #[test]
+    fn display_reorder_changes_catalog_priority_without_changing_model_ceilings() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.init().unwrap();
+        let original = storage.list_managed_models_v2(true).unwrap();
+        let enabled = original
+            .iter()
+            .filter(|model| model.enabled && model.supported_in_api)
+            .collect::<Vec<_>>();
+        let mut ceilings = Vec::new();
+        for ceiling in &enabled {
+            for model in &enabled {
+                ceilings.push((
+                    model.slug.clone(),
+                    ceiling.slug.clone(),
+                    request_exceeds_model_ceiling(&storage, Some(&model.slug), &ceiling.slug)
+                        .unwrap(),
+                ));
+            }
+        }
+        let expected = original
+            .iter()
+            .map(|model| model.slug.clone())
+            .collect::<Vec<_>>();
+        let mut reversed = expected.clone();
+        reversed.reverse();
+        storage
+            .reorder_managed_models_v2(&codexmanager_core::storage::ManagedModelReorderV2Params {
+                slugs: reversed.clone(),
+                expected_slugs: expected,
+            })
+            .unwrap();
+        for (slug, ceiling, before) in ceilings {
+            assert_eq!(
+                request_exceeds_model_ceiling(&storage, Some(&slug), &ceiling).unwrap(),
+                before
+            );
+        }
+        for (catalog, text_only) in [
+            (models_response_with_storage(&storage).unwrap(), false),
+            (
+                text_generation_models_response_with_storage(&storage).unwrap(),
+                true,
+            ),
+        ] {
+            let expected = reversed
+                .iter()
+                .filter(|slug| {
+                    original.iter().any(|model| {
+                        model.slug == **slug
+                            && model.enabled
+                            && model.supported_in_api
+                            && model.visibility == "list"
+                            && (!text_only || supports_text_generation(model))
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                catalog
+                    .models
+                    .iter()
+                    .map(|model| model.slug.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for (position, model) in catalog.models.iter().enumerate() {
+                assert_eq!(model.priority, position as i64);
+            }
+        }
+    }
 
     #[test]
     fn sol61_is_available_in_managed_and_codex_text_catalogs() {

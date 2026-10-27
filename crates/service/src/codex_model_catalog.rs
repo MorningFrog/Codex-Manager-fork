@@ -208,7 +208,11 @@ pub(crate) async fn selected_managed_model_catalog_content_async(
 
         let canonical_slugs = selected.iter().map(|model| model.slug.clone()).collect();
         let catalog = ModelsResponse {
-            models: selected.iter().map(selected_codex_model_info).collect(),
+            models: selected
+                .iter()
+                .enumerate()
+                .map(|(position, model)| selected_codex_model_info(position, model))
+                .collect(),
             ..ModelsResponse::default()
         };
         Ok((serialize_gateway_model_catalog(&catalog)?, canonical_slugs))
@@ -238,7 +242,11 @@ pub(crate) async fn reconciled_managed_model_catalog_content_async(
 
         let canonical_slugs = selected.iter().map(|model| model.slug.clone()).collect();
         let catalog = ModelsResponse {
-            models: selected.iter().map(selected_codex_model_info).collect(),
+            models: selected
+                .iter()
+                .enumerate()
+                .map(|(position, model)| selected_codex_model_info(position, model))
+                .collect(),
             ..ModelsResponse::default()
         };
         Ok((
@@ -250,9 +258,10 @@ pub(crate) async fn reconciled_managed_model_catalog_content_async(
 }
 
 fn selected_codex_model_info(
+    position: usize,
     model: &codexmanager_core::storage::ManagedModelV2,
 ) -> codexmanager_core::rpc::types::ModelInfo {
-    let mut info = crate::models_v2::model_info(model);
+    let mut info = crate::models_v2::ordered_model_info(position, model);
     // Applying an explicit selection is the user's allowlist for Codex's picker.
     // Keep the stored flags unchanged for gateway/API behavior, but do not let
     // Codex hide an explicitly selected entry when it reads this dedicated file.
@@ -898,6 +907,21 @@ mod tests {
                 model: image_model,
             })
             .expect("make image model hidden and unavailable");
+        let before = storage
+            .list_managed_models_v2(true)
+            .expect("list before reorder");
+        let expected_slugs = before
+            .iter()
+            .map(|model| model.slug.clone())
+            .collect::<Vec<_>>();
+        let mut reversed = expected_slugs.clone();
+        reversed.reverse();
+        storage
+            .reorder_managed_models_v2(&codexmanager_core::storage::ManagedModelReorderV2Params {
+                slugs: reversed,
+                expected_slugs,
+            })
+            .expect("save display order");
         let requested_keys = HashSet::from(["gpt-6-sol", "gpt-image-2"]);
         let expected = crate::models_v2::list_with_storage(&storage, true)
             .expect("list full catalog")
@@ -919,8 +943,17 @@ mod tests {
         .await
         .expect("build selected catalog");
         assert_eq!(canonical, expected);
+        let (reconciled, reconciled_slugs) =
+            reconciled_managed_model_catalog_content_async(&storage, canonical.clone())
+                .await
+                .expect("reconcile reordered catalog");
+        assert_eq!(reconciled_slugs, canonical);
+        assert_eq!(reconciled.as_deref(), Some(content.as_str()));
         let catalog: serde_json::Value = serde_json::from_str(&content).expect("parse catalog");
         let models = catalog["models"].as_array().expect("models array");
+        for (position, model) in models.iter().enumerate() {
+            assert_eq!(model["priority"].as_i64(), Some(position as i64));
+        }
         assert_eq!(
             models
                 .iter()

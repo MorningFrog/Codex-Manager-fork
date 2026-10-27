@@ -277,6 +277,7 @@ fn admin_only_method(method: &str) -> bool {
             | "account/usage/resetCredits"
             | "account/usage/resetCredit/consume"
             | "apikey/managedModelPriceSyncV2"
+            | "apikey/managedModelReorderV2"
             | "storage/spaceUsage"
             | "storage/reclaim"
     )

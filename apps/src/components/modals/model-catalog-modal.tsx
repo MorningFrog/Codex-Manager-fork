@@ -3,6 +3,10 @@
 import { useMemo, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 
+import { OrderControls } from "@/components/models/order-controls";
+import { useListReorder } from "@/hooks/useListReorder";
+import { moveRouteOrder } from "@/lib/model-order";
+
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -488,6 +492,15 @@ export function ModelCatalogModal({
     }));
   };
 
+  const routeOrder = useListReorder(
+    draft.routes.map((route) => route.key),
+    Boolean(isSaving),
+    (source, target) => setDraft((current) => ({
+      ...current,
+      routes: moveRouteOrder(current.routes, source, target),
+    })),
+  );
+
   const handleSave = async () => {
     try {
       setError(null);
@@ -665,13 +678,16 @@ export function ModelCatalogModal({
 
               <div className="grid gap-4 md:grid-cols-3">
                 <div className="space-y-2">
-                  <Label htmlFor="model-sort-order">{t("排序")}</Label>
+                  <Label htmlFor="model-sort-order">{t("模型等级（高级）")}</Label>
                   <Input
                     id="model-sort-order"
                     type="number"
                     value={draft.sortOrder}
                     onChange={(event) => updateDraft("sortOrder", event.target.value)}
                   />
+                  <p className="text-xs text-muted-foreground">
+                    {t("数值越小等级越高，影响模型上限；显示顺序请在列表中调整。")}
+                  </p>
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="model-context-window">{t("上下文窗口")}</Label>
@@ -939,6 +955,9 @@ export function ModelCatalogModal({
                   </Button>
                 </div>
               </div>
+              <p className="text-xs text-muted-foreground">
+                {t("调整顺序会重新编号全部路由的优先级，靠前的更高；未调整时保留原有优先级。权重保持不变，保存后生效。")}
+              </p>
 
               {draft.routes.length === 0 ? (
                 <div className="rounded-lg border border-dashed p-8 text-center text-sm text-muted-foreground">
@@ -946,7 +965,25 @@ export function ModelCatalogModal({
                 </div>
               ) : (
                 draft.routes.map((route, index) => (
-                  <Card key={route.key} size="sm">
+                  <Card
+                    key={route.key}
+                    size="sm"
+                    data-route-key={route.key}
+                    {...routeOrder.rowProps(route.key)}
+                    className="data-[drop-target=true]:outline data-[drop-target=true]:outline-primary"
+                  >
+                    <CardHeader className="flex flex-row items-center gap-2">
+                      <CardTitle className="text-xs text-muted-foreground">{t("顺序")}</CardTitle>
+                      <OrderControls
+                        position={index + 1}
+                        label={t("移动路由 {index}", { index: index + 1 })}
+                        disabled={Boolean(isSaving)}
+                        first={index === 0}
+                        last={index === draft.routes.length - 1}
+                        handleProps={routeOrder.handleProps(route.key)}
+                        onMove={(offset) => routeOrder.moveBy(route.key, offset)}
+                      />
+                    </CardHeader>
                     <CardContent className="space-y-3">
                       <div className="grid gap-3 md:grid-cols-[minmax(150px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)]">
                         <div className="min-w-0 space-y-2">

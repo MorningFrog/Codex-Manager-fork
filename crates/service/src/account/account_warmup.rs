@@ -440,9 +440,18 @@ fn resolve_warmup_model_slug_with_ceiling(
     configured_ceiling: &str,
 ) -> Result<String, String> {
     let storage = &crate::account::remote_storage::AccountStorage::new(storage);
-    let models = storage
+    let mut models = storage
         .list_api_models_v2()
         .map_err(|err| format!("list warmup models failed: {err}"))?;
+    // Display order is a picker preference. Keep automatic warmup selection
+    // on the existing model rank, including its deterministic slug tie-break.
+    models.sort_by(|left, right| {
+        left.sort_order.cmp(&right.sort_order).then_with(|| {
+            left.slug
+                .to_ascii_lowercase()
+                .cmp(&right.slug.to_ascii_lowercase())
+        })
+    });
     let first_text_model = models
         .iter()
         .find(|model| crate::models_v2::supports_text_generation(model));

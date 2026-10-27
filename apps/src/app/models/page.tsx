@@ -19,6 +19,7 @@ import {
 
 import { PageHeader, MetricCard, PageWorkspace } from "@/components/layout/page-workspace";
 import { BatchModelStateDropdown } from "@/components/models/batch-model-state-dropdown";
+import { OrderControls } from "@/components/models/order-controls";
 import {
   ModelStateDropdown,
   type ModelStateTarget,
@@ -63,6 +64,7 @@ import {
   useCodexProfileModeStatus,
 } from "@/hooks/useCodexProfileModeStatus";
 import { useManagedModels } from "@/hooks/useManagedModels";
+import { useListReorder } from "@/hooks/useListReorder";
 import { usePageTransitionReady } from "@/hooks/usePageTransitionReady";
 import { useRuntimeCapabilities } from "@/hooks/useRuntimeCapabilities";
 import { accountClient } from "@/lib/api/account-client";
@@ -72,6 +74,7 @@ import {
 } from "@/lib/api/codex-profile-client";
 import { microusdToUsdPerMillion } from "@/lib/api/managed-models-v2";
 import { useI18n } from "@/lib/i18n/provider";
+import { moveVisibleItemOrder } from "@/lib/model-order";
 import type { CodexProfileApiKeyCandidate } from "@/types";
 import type {
   ManagedModelBatchRouteAssignmentV2,
@@ -249,6 +252,8 @@ export default function ModelsPage() {
     assignModelRoutes,
     previewImport,
     commitImport,
+    reorderModels,
+    isReordering,
     isRefreshing,
     isApplyingModels,
     isSyncingPrices,
@@ -262,6 +267,7 @@ export default function ModelsPage() {
   } = useManagedModels();
   usePageTransitionReady("/models/", !isServiceReady || !isLoading);
   const isModelMutationPending =
+    isReordering ||
     isApplyingModels ||
     isSyncingPrices ||
     isSaving ||
@@ -378,6 +384,15 @@ export default function ModelsPage() {
       ].some((value) => value.toLocaleLowerCase().includes(needle));
     });
   }, [filter, models, search]);
+
+  const modelKeys = models.map((model) => model.slug);
+  const visibleModelKeys = filteredModels.map((model) => model.slug);
+  const canReorder = isAdminMode && !isSessionLoading && isServiceReady && !isModelOperationPending;
+  const modelOrder = useListReorder(visibleModelKeys, !canReorder, (source, target) => {
+    const slugs = moveVisibleItemOrder(modelKeys, visibleModelKeys, source, target);
+    if (slugs.every((slug, index) => slug === modelKeys[index])) return;
+    void reorderModels({ slugs, expectedSlugs: modelKeys });
+  });
 
   const editingModel = useMemo(
     () => models.find((model) => model.slug === editingSlug) || null,
@@ -570,6 +585,9 @@ export default function ModelsPage() {
                       <span className="mt-0.5 block text-primary/80">
                         {t("未勾选时同步全部模型并保留自定义价格；勾选的模型会用外部价格覆盖自定义价格。")}
                       </span>
+                      <span className="mt-0.5 block text-muted-foreground">
+                        {t("拖动顺序列或点击箭头调整模型顺序，自动保存；筛选时只调整当前显示的模型。")}
+                      </span>
                     </>
                   ) : null}
                 </p>
@@ -681,6 +699,7 @@ export default function ModelsPage() {
                           />
                         </TableHead>
                       ) : null}
+                      <TableHead className="w-28">{t("顺序")}</TableHead>
                       <TableHead>{t("模型")}</TableHead>
                       <TableHead>{t("来源")}</TableHead>
                       <TableHead className="min-w-[132px]">{t("状态")}</TableHead>
@@ -691,11 +710,16 @@ export default function ModelsPage() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {filteredModels.map((model) => {
+                    {filteredModels.map((model, index) => {
                       const routeCount = enabledRouteCount(model);
                       const description = modelDescription(model, t);
                       return (
-                        <TableRow key={model.id || model.slug}>
+                        <TableRow
+                          key={model.id || model.slug}
+                          data-model-slug={model.slug}
+                          {...modelOrder.rowProps(model.slug)}
+                          className="data-[drop-target=true]:bg-accent data-[drop-target=true]:outline data-[drop-target=true]:outline-primary"
+                        >
                           {isAdminMode ? (
                             <TableCell>
                               <Checkbox
@@ -712,6 +736,19 @@ export default function ModelsPage() {
                               />
                             </TableCell>
                           ) : null}
+                          <TableCell>
+                            {isAdminMode && !isSessionLoading ? (
+                              <OrderControls
+                                position={modelKeys.indexOf(model.slug) + 1}
+                                label={t("移动模型 {slug}", { slug: model.slug })}
+                                disabled={!canReorder}
+                                first={index === 0}
+                                last={index === filteredModels.length - 1}
+                                handleProps={modelOrder.handleProps(model.slug)}
+                                onMove={(offset) => modelOrder.moveBy(model.slug, offset)}
+                              />
+                            ) : <span className="font-mono text-xs">{modelKeys.indexOf(model.slug) + 1}</span>}
+                          </TableCell>
                           <TableCell className="min-w-[240px]">
                             <div className="font-medium">{model.displayName}</div>
                             <div className="font-mono text-xs text-muted-foreground">{model.slug}</div>

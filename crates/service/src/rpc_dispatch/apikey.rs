@@ -2,8 +2,8 @@ use codexmanager_core::rpc::types::{
     ApiKeyListResult, ApiKeyUsageStatListResult, JsonRpcRequest, JsonRpcResponse,
 };
 use codexmanager_core::storage::{
-    ManagedModelBatchStateV2Update, ManagedModelStateV2Update, ManagedModelV2,
-    ManagedModelV2Upsert, ModelCatalogV2Stats,
+    ManagedModelBatchStateV2Update, ManagedModelReorderV2Params, ManagedModelStateV2Update,
+    ManagedModelV2, ManagedModelV2Upsert, ModelCatalogV2Stats,
 };
 
 use crate::RpcActor;
@@ -262,6 +262,24 @@ pub(super) fn try_handle(req: &JsonRpcRequest, actor: &RpcActor) -> Option<JsonR
                         )
                     });
                 super::value_or_error(params.and_then(crate::models_v2::batch_update_state))
+            }
+        }
+        "apikey/managedModelReorderV2" => {
+            if !actor.is_admin() {
+                super::value_or_error::<Vec<ManagedModelV2>>(Err(super::permission_denied(
+                    "apikey/managedModelReorderV2",
+                )))
+            } else {
+                let params = req
+                    .params
+                    .clone()
+                    .ok_or_else(|| "missing managed model V2 reorder payload".to_string())
+                    .and_then(|value| {
+                        serde_json::from_value::<ManagedModelReorderV2Params>(value).map_err(
+                            |err| format!("parse managed model V2 reorder payload failed: {err}"),
+                        )
+                    });
+                super::value_or_error(params.and_then(crate::models_v2::reorder))
             }
         }
         "apikey/managedModelDeleteV2" => {

@@ -165,6 +165,7 @@ fn specs() -> Vec<TableSpec> {
         spec(crate::request_token_stats::Entity),
         spec(crate::usage_snapshots::Entity),
         spec(crate::model_catalog::models::Entity),
+        spec(crate::model_catalog::display_order::Entity),
         spec(crate::model_catalog::prices::Entity),
         spec(crate::model_catalog::price_tiers::Entity),
         spec(crate::model_catalog::routes::Entity),
@@ -791,7 +792,11 @@ mod tests {
     async fn current_desktop_sqlite_imports_with_domain_data() {
         let (source, archive) = paths();
         legacy_fixture(&source);
+        let expected_model_order = desktop_model_order(&source);
         let report = export_sqlite(&source, &archive).await.unwrap();
+        assert!(report.iter().any(|table| {
+            table.table == "model_display_order" && table.rows == expected_model_order.len() as u64
+        }));
         let target = SeaOrmStorage::connect(StorageBackendKind::Sqlite, "sqlite::memory:")
             .await
             .unwrap();
@@ -814,6 +819,19 @@ mod tests {
             .unwrap();
         assert_eq!(model.routes[0].upstream_model, "fixture");
         assert_eq!(model.price_tiers.len(), 1);
+        assert_eq!(
+            model.sort_order, 0,
+            "display moves must preserve model rank"
+        );
+        assert_eq!(
+            crate::ManagedModelsRepository::list(target.connection(), true)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|model| model.slug)
+                .collect::<Vec<_>>(),
+            expected_model_order
+        );
         let key = crate::ApiKeysRepository::get(target.connection(), "transfer-key")
             .await
             .unwrap()
@@ -828,6 +846,16 @@ mod tests {
         std::fs::remove_file(source).unwrap();
     }
 
+    fn desktop_model_order(source: &Path) -> Vec<String> {
+        codexmanager_core::storage::Storage::open(source)
+            .unwrap()
+            .list_managed_models_v2(true)
+            .unwrap()
+            .into_iter()
+            .map(|model| model.slug)
+            .collect()
+    }
+
     pub(super) fn legacy_fixture(source: &Path) {
         let legacy = codexmanager_core::storage::Storage::open(source).unwrap();
         legacy.init().unwrap();
@@ -835,8 +863,8 @@ mod tests {
             .set_app_setting("transfer_fixture", "retained", 1)
             .unwrap();
         use codexmanager_core::storage::{
-            ApiKey, ManagedModelV2, ManagedModelV2Upsert, ModelPriceTierV2, ModelPriceV2,
-            ModelRouteV2,
+            ApiKey, ManagedModelReorderV2Params, ManagedModelV2, ManagedModelV2Upsert,
+            ModelPriceTierV2, ModelPriceV2, ModelRouteV2,
         };
         legacy
             .upsert_managed_models_v2(&[ManagedModelV2Upsert {
@@ -875,6 +903,18 @@ mod tests {
                     ..Default::default()
                 },
             }])
+            .unwrap();
+        let expected_slugs = legacy
+            .list_managed_models_v2(true)
+            .unwrap()
+            .into_iter()
+            .map(|model| model.slug)
+            .collect::<Vec<_>>();
+        legacy
+            .reorder_managed_models_v2(&ManagedModelReorderV2Params {
+                slugs: expected_slugs.iter().rev().cloned().collect(),
+                expected_slugs,
+            })
             .unwrap();
         legacy
             .insert_api_key(&ApiKey {
@@ -1108,6 +1148,7 @@ mod tests {
     async fn import_into_real_database(backend: StorageBackendKind, env: &str) {
         let (source, archive) = paths();
         legacy_fixture(&source);
+        let expected_model_order = desktop_model_order(&source);
         let expected = export_sqlite(&source, &archive).await.unwrap();
         let url = std::env::var(env).expect("isolated empty import test database URL");
         let target = SeaOrmStorage::connect(backend, &url)
@@ -1129,6 +1170,15 @@ mod tests {
         assert_eq!(stat.input_tokens, Some(9_007_199_254_740_993));
         assert!(stat.usage_included);
         assert_eq!(stat.estimated_cost_usd, Some(0.125));
+        assert_eq!(
+            crate::ManagedModelsRepository::list(target.connection(), true)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|model| model.slug)
+                .collect::<Vec<_>>(),
+            expected_model_order
+        );
         std::fs::remove_file(archive).unwrap();
         std::fs::remove_file(source).unwrap();
     }

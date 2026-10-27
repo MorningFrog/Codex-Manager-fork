@@ -1,6 +1,8 @@
 use super::*;
 #[path = "account_reset_warmup_rpc_tests.rs"]
 mod account_reset_warmup_rpc_tests;
+#[path = "model_order_rpc_tests.rs"]
+mod model_order_rpc_tests;
 use codexmanager_core::rpc::types::{
     JsonRpcMessage, JsonRpcResponse, ModelGroupModelUpsertParams, ModelGroupModelsSetParams,
     ModelGroupUsersSetParams,
@@ -140,6 +142,7 @@ fn member_actor_cannot_call_admin_only_rpc() {
         "codexSkills/marketplacePluginInstall",
         "apikey/managedModelUpdateStateV2",
         "apikey/managedModelBatchUpdateStateV2",
+        "apikey/managedModelReorderV2",
     ] {
         let req = JsonRpcRequest {
             id: 21.into(),

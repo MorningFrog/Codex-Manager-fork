@@ -1,6 +1,6 @@
 use super::*;
 use crate::storage_helpers::seaorm_block_on;
-use codexmanager_core::storage::ManagedModelPriceV2Update;
+use codexmanager_core::storage::{ManagedModelPriceV2Update, ManagedModelReorderV2Params};
 use codexmanager_storage_seaorm::ManagedModelsRepository;
 
 pub(super) fn list(include_hidden: bool) -> Result<ManagedModelListV2Result, String> {
@@ -20,6 +20,13 @@ pub(super) fn get(slug: &str) -> Result<Option<ManagedModelV2>, String> {
     let slug = slug.to_owned();
     seaorm_block_on(move |storage| async move {
         ManagedModelsRepository::get(storage.connection(), &slug)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+pub(super) fn reorder(input: ManagedModelReorderV2Params) -> Result<Vec<ManagedModelV2>, String> {
+    seaorm_block_on(move |storage| async move {
+        ManagedModelsRepository::reorder(storage.connection(), &input)
             .await
             .map_err(|e| e.to_string())
     })

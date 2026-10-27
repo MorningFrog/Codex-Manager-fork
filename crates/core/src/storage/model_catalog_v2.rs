@@ -2298,9 +2298,9 @@ impl Storage {
 
     pub fn list_managed_models_v2(&self, include_hidden: bool) -> Result<Vec<ManagedModelV2>> {
         let sql = if include_hidden {
-            format!("{MODEL_SELECT} ORDER BY m.sort_order ASC,m.slug ASC")
+            format!("{MODEL_SELECT} LEFT JOIN model_display_order d ON d.model_id=m.id ORDER BY d.position IS NULL,d.position ASC,m.sort_order ASC,m.slug ASC")
         } else {
-            format!("{MODEL_SELECT} WHERE m.visibility='list' ORDER BY m.sort_order ASC,m.slug ASC")
+            format!("{MODEL_SELECT} LEFT JOIN model_display_order d ON d.model_id=m.id WHERE m.visibility='list' ORDER BY d.position IS NULL,d.position ASC,m.sort_order ASC,m.slug ASC")
         };
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
@@ -2312,7 +2312,7 @@ impl Storage {
     }
 
     pub fn list_api_models_v2(&self) -> Result<Vec<ManagedModelV2>> {
-        let sql = format!("{MODEL_SELECT} WHERE m.enabled=1 AND m.supported_in_api=1 AND m.visibility='list' ORDER BY m.sort_order ASC,m.slug ASC");
+        let sql = format!("{MODEL_SELECT} LEFT JOIN model_display_order d ON d.model_id=m.id WHERE m.enabled=1 AND m.supported_in_api=1 AND m.visibility='list' ORDER BY d.position IS NULL,d.position ASC,m.sort_order ASC,m.slug ASC");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         let mut models = Vec::new();
@@ -5804,6 +5804,10 @@ mod tests {
             .conn
             .execute_batch(include_str!("../../migrations/129_model_fast_policy.sql"))
             .expect("add model fast policy schema");
+        storage
+            .conn
+            .execute_batch(include_str!("../../migrations/144_model_display_order.sql"))
+            .expect("add model display order schema");
 
         assert_eq!(
             storage

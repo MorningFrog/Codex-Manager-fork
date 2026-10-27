@@ -1,6 +1,7 @@
 //! V2 model metadata, routing and base prices in separate relational tables.
 //! Price tiers, group authorization and billing ledgers remain separate work.
 
+pub(crate) mod display_order;
 mod managed;
 pub(crate) mod models;
 mod reconcile;
